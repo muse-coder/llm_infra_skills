@@ -338,17 +338,148 @@ logit_kl_temperature: 1.0    # 温度
 
 ---
 
-## 六、已知问题和 Workaround
+## 六、重计算（Recompute）配置详解
+
+### 两大类重计算策略
+
+通过 `--recompute-granularity` 控制：
+
+#### 方式 A: `full`（整层重计算）
+
+整个 Transformer 层的激活都不保存，反向传播时重新计算。**必须**配合 `--recompute-method` 和 `--recompute-num-layers` 使用（三个参数缺一不可，否则报错）。
+
+```bash
+--recompute-granularity full \
+--recompute-method block \        # 或 uniform
+--recompute-num-layers 48 \       # 重计算的层数
+```
+
+| 参数 | 说明 |
+|------|------|
+| `--recompute-method block` | 从第 1 层开始，连续选 N 层做重计算，其余层正常保存激活 |
+| `--recompute-method uniform` | 把所有层均匀分组，每组 N 层，每组内做一次 checkpoint |
+| `--recompute-num-layers N` | **block** 模式 = 重计算的总层数；**uniform** 模式 = 每组的层数 |
+
+- **优点**: 省显存最多
+- **缺点**: 速度最慢（~30-50% 开销）
+- **推荐**: 显存严重不足时使用，`num_layers` 设为模型总层数即全部重计算
+
+#### 方式 B: `selective`（细粒度选择性重计算）
+
+只重计算指定的子模块，其余模块正常保存激活。**不需要** `--recompute-method` 和 `--recompute-num-layers`（设了会报错）。
+
+```bash
+--recompute-granularity selective \
+--recompute-modules core_attn layernorm \
+```
+
+### 可选的 `--recompute-modules`（共 7 个）
+
+| 模块名 | 作用 | 重计算方式 | QAD MoE 可用 | 限制条件 |
+|--------|------|-----------|:---:|---------|
+| `core_attn` | 注意力计算（QKV → softmax → output） | 标准 checkpoint | ✅ | 默认值；TE fused attention 时不需要 |
+| `layernorm` | `input_layernorm` + `pre_mlp_layernorm` | 丢弃输出式 | ✅ | FP8 delayed scaling 不支持 |
+| `mlp` | Dense MLP 子模块 | 标准 checkpoint | ✅ | — |
+| `moe` | 整个 MoE 层（路由 + 专家） | 标准 checkpoint | ✅ | — |
+| `shared_experts` | MoE 中的共享专家 | 标准 checkpoint | ✅ | 不能与 `--moe-shared-expert-overlap` 同时用 |
+| `moe_act` | MoE 专家的激活函数 | 丢弃输出式 | ❌ | **需要 `moe_grouped_gemm=True`，QAD 强制为 False** |
+| `mla_up_proj` | MLA 的上投影 + RoPE | 丢弃输出式 | ❌ | **需要 `multi_latent_attention`，仅 DeepSeek-V2/V3** |
+
+**QAD MoE 模型推荐组合**（按省显存程度递增）：
+1. `--recompute-modules core_attn` — 最小开销
+2. `--recompute-modules core_attn layernorm` — 中等
+3. `--recompute-modules core_attn layernorm moe` — 较大
+4. 改用 `full + block + N` — 最大
+
+### 对比总结
+
+| 维度 | `full + block` | `selective` |
+|------|---------------|-------------|
+| 省显存 | 最多（整层重算） | 中等（只重算选定模块） |
+| 速度影响 | 慢 ~30-50% | 慢 ~5-15% |
+| 配置复杂度 | 简单（3 个参数） | 需要了解模型结构选模块 |
+| 推荐场景 | 显存严重不足 | 显存略紧，想在速度和显存间取平衡 |
+
+---
+
+## 七、OOM 解决方案
+
+QAD 训练要同时加载 Student + Teacher 两个模型，显存压力比普通训练大很多。按优先级排序：
+
+### 1. PyTorch 内存碎片优化（零成本）
+
+```bash
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+```
+
+当报错信息中出现 "reserved but unallocated memory is large" 时，说明有显存碎片。此环境变量可减少碎片，可能直接解决 OOM。
+
+### 2. 启用重计算（见上方第六章）
+
+推荐顺序：
+- 先试 `selective + core_attn`
+- 不够则加 `layernorm`、`moe`
+- 最后用 `full + block + 全部层数`
+
+### 3. 降低 Global Batch Size
+
+```bash
+--global-batch-size 32   # 从 64 降到 32
+```
+
+GBS 通过梯度累积实现，理论上不额外占显存，但累积过程中的中间状态会有一定开销。
+
+### 4. 降低 seq-length
+
+```bash
+--seq-length 16384   # 从 32768 降到 16384
+```
+
+Attention 激活占用与 seq_length² 成正比。如果数据中大部分样本不到目标长度，可以先用较短的 seq_length 跑通。
+
+### 5. 禁止使用的参数
+
+- `--manual-gc` — 与 KD 训练不兼容，会触发 assertion failure
+
+---
+
+## 八、自定义数据集预转换
+
+### 问题背景
+
+SFTDataset 使用 `datasets.load_dataset(path, **kwargs)` 加载数据。对于非标准格式的数据集（如 `nvidia/OpenMathReasoning` 的 `problem`/`generated_solution` 字段），需要预转换为 OpenAI 对话格式。
+
+### load_dataset 对本地文件的限制
+
+- **本地目录**: `load_dataset("/path/to/dir")` ✅ 自动扫描目录中的 json/jsonl/parquet/arrow 文件
+- **单个 JSONL 文件**: `load_dataset("/path/to/file.jsonl")` ❌ 会报 `FileNotFoundError`
+- **正确方式**: 把 JSONL 文件放到一个目录里，然后 `--finetune-hf-dataset` 指向该目录
+
+### 预转换流程（以 OpenMathReasoning 为例）
+
+原始格式: parquet，字段为 `problem`/`generated_solution`（不是 `conversations`/`messages`）
+
+```python
+# 转换为 OpenAI 格式 JSONL:
+# {"conversations": [{"role": "user", "content": "<problem>"}, {"role": "assistant", "content": "<solution>"}]}
+```
+
+转换后放到目录中（如 `/path/to/cot_sft/train.jsonl`），然后：
+```bash
+export TRAIN_DATA=/path/to/cot_sft   # 指向目录，不是文件
+```
+
+---
+
+## 九、已知问题和 Workaround
 
 ### 1. TP+EP 不支持（量化时）
 **现象**: `ValueError: TP+EP is not supported by QuantSequentialMLP`
 **Workaround**: quantize/finetune 时 TP=1, EP=N
 
 ### 2. 训练时显存 OOM
-**现象**: 蒸馏模型比普通训练多几 MB/microbatch 的开销
-**Workaround**: 
-- 不要用 `--manual-gc`
-- 开启 recompute: `--recompute-granularity full --recompute-method block --recompute-num-layers N`
+**现象**: QAD 要同时加载 Student + Teacher，显存压力大
+**Workaround**: 见第七章 OOM 解决方案
 
 ### 3. 训练速度慢 ~40%
 **现象**: 每个 iteration 比不用 KD 时慢约 40%
@@ -370,7 +501,7 @@ logit_kl_temperature: 1.0    # 温度
 
 ---
 
-## 七、关键文件索引
+## 十、关键文件索引
 
 ```
 examples/post_training/modelopt/
@@ -408,7 +539,7 @@ modelopt/torch/distill/losses.py                  # KL/Cosine loss 实现
 
 ---
 
-## 八、快速 Checklist
+## 十一、快速 Checklist
 
 开始 QAD 前，确认以下事项:
 

@@ -329,6 +329,101 @@ These flags CANNOT be used with KD training:
 
 ---
 
+## Activation Recompute (Memory Optimization)
+
+### Two Strategies via `--recompute-granularity`
+
+#### `full` — Entire Layer Recompute
+
+All three params MUST be set together (enforced by code validation):
+
+```bash
+--recompute-granularity full \
+--recompute-method block \        # or "uniform"
+--recompute-num-layers 48 \       # number of layers to recompute
+```
+
+- `block`: recompute first N layers, rest save activations normally
+- `uniform`: divide all layers into groups of N, checkpoint each group
+- `num_layers`: for block = total layers to recompute; for uniform = layers per group
+- **Pros**: Maximum memory savings. **Cons**: ~30-50% slower
+
+#### `selective` — Fine-grained Module Recompute
+
+Does NOT use `--recompute-method` or `--recompute-num-layers` (will error if set).
+
+```bash
+--recompute-granularity selective \
+--recompute-modules core_attn layernorm \
+```
+
+### Available `--recompute-modules` (7 total)
+
+| Module | What it recomputes | Checkpoint type | QAD MoE compatible | Constraint |
+|--------|-------------------|----------------|:---:|------------|
+| `core_attn` | Attention computation | Standard | ✅ | Default; not needed with TE fused attention |
+| `layernorm` | input_layernorm + pre_mlp_layernorm | Output-discarding | ✅ | No FP8 delayed scaling |
+| `mlp` | Dense MLP submodule | Standard | ✅ | — |
+| `moe` | Entire MoE layer (router + experts) | Standard | ✅ | — |
+| `shared_experts` | Shared experts in MoE | Standard | ✅ | No `--moe-shared-expert-overlap` |
+| `moe_act` | MoE expert activation function | Output-discarding | ❌ | **Requires `moe_grouped_gemm=True`; QAD forces False** |
+| `mla_up_proj` | MLA up projection + RoPE | Output-discarding | ❌ | **Requires `multi_latent_attention`; DeepSeek only** |
+
+**QAD MoE recommended escalation** (increasing memory savings):
+1. `core_attn` only — minimal overhead
+2. `core_attn layernorm` — moderate
+3. `core_attn layernorm moe` — significant
+4. Switch to `full + block + all_layers` — maximum
+
+---
+
+## OOM Solutions for QAD Training
+
+QAD loads Student + Teacher simultaneously, roughly doubling memory vs normal training.
+
+### Fix Priority Order
+
+1. **PyTorch memory fragmentation** (zero cost):
+   ```bash
+   export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+   ```
+   Use when error shows "reserved but unallocated memory is large".
+
+2. **Enable recompute** (see above): Start with `selective core_attn`, escalate as needed.
+
+3. **Lower `--global-batch-size`**: e.g., 64 → 32. Reduces gradient accumulation intermediate states.
+
+4. **Lower `--seq-length`**: Attention memory scales with seq_length². Try 16K before 32K.
+
+5. **NEVER use `--manual-gc`** with KD training — causes assertion failure.
+
+---
+
+## Custom Dataset Preprocessing
+
+### load_dataset Local File Behavior
+
+SFTDataset uses `datasets.load_dataset(path, **kwargs)`. Local path rules:
+- **Directory path**: ✅ Auto-scans for json/jsonl/parquet/arrow files
+- **Single JSONL file path**: ❌ `FileNotFoundError: Couldn't find any data file`
+- **Solution**: Put JSONL files inside a directory, point `--finetune-hf-dataset` to the directory
+
+### Non-standard Dataset Conversion (e.g., OpenMathReasoning)
+
+Datasets with fields like `problem`/`generated_solution` (not `conversations`/`messages`) MUST be pre-converted:
+
+```python
+# Input:  {"problem": "...", "generated_solution": "..."}
+# Output: {"conversations": [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]}
+```
+
+Output to a directory (e.g., `/path/to/cot_sft/train.jsonl`), then:
+```bash
+--finetune-hf-dataset /path/to/cot_sft   # directory, NOT file
+```
+
+---
+
 ## Troubleshooting
 
 ### Poor Training Results Checklist
