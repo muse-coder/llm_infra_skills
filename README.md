@@ -13,6 +13,12 @@ llm_infra_skills/
 │   ├── megatron-qad.skill.md  # QAD 量化蒸馏 Skill
 │   └── QAD_Megatron_Complete_Guide.md  # QAD 完整知识库
 │
+├── rtp-llm/                   # RTP-LLM 推理引擎
+│   ├── rtp-llm-build-test.skill.md        # 构建与测试 Skill
+│   ├── rtp-llm-code-review.skill.md       # Code Review Skill
+│   ├── RTP-LLM_Build_Test_Complete_Guide.md  # 构建测试完整知识库
+│   └── RTP-LLM_Code_Review_Patterns.md    # Code Review 已知问题模式
+│
 ├── vllm/                      # (待添加) vLLM 部署相关
 ├── trt-llm/                   # (待添加) TensorRT-LLM 相关
 └── infra/                     # (待添加) GPU/NCCL/集群调试
