@@ -19,6 +19,11 @@
 10. [实测效果与验证数据](#10-实测效果与验证数据)
 11. [使用方式](#11-使用方式)
 12. [常见误区](#12-常见误区)
+13. [TurboQuant 在 LLM 推理流程中的位置](#13-turboquant-在-llm-推理流程中的位置)
+14. [完整计算流程详解](#14-完整计算流程详解)
+15. [非对称 KV 量化的发现（Asymmetric KV Discovery）](#15-非对称-kv-量化的发现asymmetric-kv-discovery)
+16. [上下文退化问题与修复（Context Scaling）](#16-上下文退化问题与修复context-scaling)
+17. [注意力门控优化（Attention-Gated Optimizations）](#17-注意力门控优化attention-gated-optimizations)
 
 ---
 
@@ -589,3 +594,302 @@ python3 benchmarks/validate_real_model.py  # 真实模型验证（需下载 Qwen
 ### ❌ 误区 5：旋转矩阵每次推理都要重新生成
 
 **正确**：旋转矩阵由固定 seed 生成，在 `__init__` 时预计算一次，推理时复用。量化和反量化用同一个旋转矩阵，保证可逆性。
+
+---
+
+## 13. TurboQuant 在 LLM 推理流程中的位置
+
+### 13.1 整体推理流程定位
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      LLM 推理流程                                │
+│                                                                 │
+│  Input Tokens → Embedding                                       │
+│       ↓                                                         │
+│  ┌─── Transformer Layer × N ─────────────────────────────────┐  │
+│  │                                                            │  │
+│  │   Q = x @ W_q                                             │  │
+│  │   K = x @ W_k  ──→ 【TurboQuant 压缩】──→ 写入 K Cache    │  │
+│  │   V = x @ W_v  ──→ 【PolarQuant 压缩】──→ 写入 V Cache    │  │
+│  │                                                            │  │
+│  │   Decode 时：                                              │  │
+│  │   K Cache ──→ 【反量化】──→ Attention Score (Q·Kᵀ)        │  │
+│  │   V Cache ──→ 【反量化】──→ 加权求和 (attn_weights·V)     │  │
+│  │                                                            │  │
+│  └────────────────────────────────────────────────────────────┘  │
+│       ↓                                                         │
+│  FFN → Output Token                                             │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 13.2 两个推理阶段的具体作用时机
+
+| 阶段 | 操作 | TurboQuant 的角色 |
+|------|------|-----------------|
+| **Prefill（输入处理）** | 处理所有输入 tokens，计算每层 K/V | 压缩写入 Cache：K → TurboQuant，V → PolarQuant |
+| **Decode（逐 token 生成）** | 每次生成一个新 token | 读取全部历史 K/V，反量化后参与 Attention 计算 |
+
+**关键**：TurboQuant **完全不涉及训练**，不改变模型权重，只压缩推理时动态生成的 KV Cache。
+
+### 13.3 为什么 KV Cache 是瓶颈
+
+```
+Llama-3 70B，128K context，fp16 KV Cache ≈ 64GB
+→ 直接撑爆消费级显存
+
+TurboQuant turbo3：压缩 4.9x → 约 13GB
+→ 在 Mac M2 Pro 64GB 上可跑 128K context
+```
+
+Decode 阶段每生成一个 token，都要读取**全部历史 KV Cache**，KV Cache 越大，内存带宽压力越大，速度越慢。压缩 KV Cache 同时解决了**内存容量**和**带宽**两个瓶颈。
+
+---
+
+## 14. 完整计算流程详解
+
+### 14.1 量化流程（Prefill 写入时）
+
+```
+输入向量 x，shape: (head_dim=128,)
+│
+▼ ── PolarQuant Stage 1 (b-1 bits) ──────────────────────────
+│
+│  Step 1: 提取 L2 范数并归一化（论文 page 5 要求）
+│    norm = ||x||₂
+│    x_unit = x / norm          ← 归一化到单位球面
+│
+│  Step 2: 随机旋转（WHT Gaussianization）
+│    y = R @ x_unit             ← 旋转后各坐标趋向高斯分布
+│                                  原始峰度 900 → 旋转后 2.9（≈ 高斯的 3.0）
+│
+│  Step 3: 最优质心量化（Lloyd-Max 质心）
+│    idx[i] = argmin_c ||y[i] - centroid[c]||   ← 每坐标独立查最近质心
+│
+│  Step 4: 计算残差（供 QJL 用，生产中跳过）
+│    residual = x - dequantize(idx, norm)
+│
+▼ ── QJL Stage 2 (1 bit，生产中关闭) ────────────────────────
+│  ⚠️ 生产中关闭原因：QJL 增加重建方差，softmax 对方差敏感会放大噪声，
+│     实测纯 PolarQuant 效果优于 PolarQuant+QJL（见第 8.1 节）
+│
+│  sign[i] = sign(P @ residual)   ← 随机投影 + 符号量化
+│  residual_norm = ||residual||₂
+│
+▼ ── 存储（生产实际存储，无 QJL 部分）────────────────────────
+
+CompressedVector {
+    mse_indices:    (128,) int8    # 质心索引，b bits/coord（生产中 b=3 或 b=4）
+    vector_norms:   float32        # 原始 L2 范数（32 bits overhead）
+    # qjl_signs 和 residual_norms 在生产中不存储
+}
+```
+
+### 14.2 反量化流程（Decode 读取时）
+
+```
+CompressedVector
+│
+▼ ── PolarQuant 反量化 ───────────────────────────────────────
+│
+│  Step 1: 查表还原旋转域向量
+│    y_hat = centroids[mse_indices]
+│
+│  Step 2: 范数修正（norm_correction，关键！）
+│    y_hat = y_hat / ||y_hat||    ← 重归一化到单位球面
+│                                    消除量化误差导致的范数漂移
+│
+│  Step 3: 逆旋转（正交矩阵，转置即逆）
+│    x_hat_unit = Rᵀ @ y_hat
+│
+│  Step 4: 乘回原始范数
+│    x_mse = x_hat_unit * vector_norms
+│
+▼ ── QJL 反量化（生产中跳过）────────────────────────────────
+│
+│  x_qjl = Pᵀ @ qjl_signs * residual_norms / √d
+│
+▼ ── 叠加输出 ────────────────────────────────────────────────
+
+x_hat = x_mse (+ x_qjl)   → 参与 Attention 计算
+```
+
+### 14.3 压缩比计算示例
+
+以 `head_dim=128, turbo3（3-bit）` 为例：
+
+```
+原始 fp16：128 × 16 = 2048 bits
+
+压缩后（生产，无 QJL）：
+  K: 128 × 3 + 32(norm) = 416 bits
+  V: 128 × 3 + 32(norm) = 416 bits
+
+单向量压缩比：2048 / 416 ≈ 4.9x
+```
+
+---
+
+## 15. 非对称 KV 量化的发现（Asymmetric KV Discovery）
+
+> 来源：`docs/asymmetric-kv-discovery.md`，2026-03-28/29 调试记录
+
+### 15.1 问题起因
+
+在 Mac Mini M2 Pro 上测试时，发现 Q4_K_M 权重模型 + turbo KV 出现灾难性 PPL：
+
+| 配置 | PPL |
+|------|-----|
+| q8_0 KV（基线） | 6.58 |
+| turbo3 KV | 3556 ← 灾难 |
+| turbo4 KV | 218 ← 灾难 |
+
+初始怀疑是 M2 Metal 硬件 Bug，经过 8 小时排查后发现真相。
+
+### 15.2 排查过程（五个阶段）
+
+| 阶段 | 假设 | 结论 |
+|------|------|------|
+| Phase 1 | M2 Metal 硬件 Bug | ❌ 排除：M2/M5 每个张量字节完全一致 |
+| Phase 2 | 模型差异 | ✅ 真相：Q4_K_M 权重 + turbo = 灾难，Q8_0 权重 + turbo = 正常 |
+| Phase 3 | 非对称救援测试 | ✅ q8_0-K + turbo3-V = PPL 6.68（仅 +1.6%） |
+| Phase 4 | turbo4-V NaN 根因 | ✅ 缺少 `kq8_0_vturbo4` Metal 内核实例化 |
+| Phase 5 | 完整修复验证 | ✅ 新增 150 个内核，所有混合对正常工作 |
+
+### 15.3 核心发现：量化叠加效应
+
+```
+Q4_K_M 权重量化
+    → K/V 激活值已含噪声
+    → 再加 turbo 量化（WHT 把噪声扩散到所有 128 个坐标）
+    → PolarQuant 质心针对干净分布优化，对噪声分布效果差
+    → K 的误差经 softmax 指数级放大
+    → PPL 灾难性劣化
+
+Q8_0 权重量化
+    → 激活值足够干净
+    → turbo 量化在容忍范围内
+    → PPL 正常
+```
+
+### 15.4 非对称救援结果（Qwen2.5-7B Q4_K_M）
+
+| K | V | PPL | vs 基线 | V 压缩比 |
+|---|---|-----|---------|---------|
+| q8_0 | q8_0 | 6.58 | — | 1.0x |
+| q8_0 | turbo4 | **6.64** | +1.0% | 2.0x |
+| q8_0 | turbo3 | **6.71** | +2.0% | 2.3x |
+| q8_0 | turbo2 | **6.91** | +5.1% | 3.2x |
+| turbo3 | turbo3 | 3556 | 灾难 | — |
+
+**结论**：K 精度是主导质量因素。K 决定注意力路由，误差经 softmax 指数级放大；V 的误差只是线性叠加，即使 2-bit 也只有 +5.1% PPL 损失。
+
+### 15.5 使用建议
+
+| 场景 | 推荐配置 |
+|------|---------|
+| Q4_K_M 模型（敏感） | `-ctk q8_0 -ctv turbo4` |
+| Q8_0 或更高权重量化 | `-ctk turbo3 -ctv turbo3` |
+| 最大 V 压缩（实验性） | `-ctk q8_0 -ctv turbo2`（3.2x，+5.1% PPL） |
+| Q4_K_M 大模型（如 Mistral-24B） | 先试 `-ctk turbo3 -ctv turbo3`，不行再换非对称 |
+
+---
+
+## 16. 上下文退化问题与修复（Context Scaling）
+
+> 来源：`docs/context-scaling-deep-dive.md`，Issue #32
+
+### 16.1 问题现象
+
+turbo3 在短上下文时速度与 q8_0 持平，但随上下文增长差距扩大：
+
+| Context | turbo3/q8_0 |
+|---------|-------------|
+| 1024 | 0.976x |
+| 2048 | 0.960x |
+| 4096 | **0.921x** ← 越来越慢 |
+
+极端情况：M1 Max 64GB，42K context，decode 从 11 t/s 跌到 4 t/s（**0.36x**）。
+
+### 16.2 排查：三个红鲱鱼
+
+| 假设 | 测试方法 | 结论 |
+|------|---------|------|
+| WHT 旋转 matmul 随 context 线性增长 | 实现 O(d log d) 自定义 WHT 算子 | ❌ 性能几乎不变，旋转不是瓶颈 |
+| `ggml_cont` 开销 | 跳过不必要的连续化操作 | ❌ +1%，可忽略 |
+| 旋转组从 128 缩到 32 | 减少计算量 | ❌ PPL 从 6.19 劣化到 7.06，质量不达标 |
+
+### 16.3 真正根因：Flash Attention 内核里的逐位置反量化
+
+每处理一个缓存 token，都要做 turbo3 反量化：
+
+```
+turbo3 反量化（每 4 个元素）：
+  - 读 qs 字节（1 次设备内存读）
+  - 位移 + 掩码提取 low2 bits（2 次 ALU × 4 元素）
+  - 读 signs 字节（1 次设备内存读）
+  - 位移 + 掩码提取 hi1 bit（2 次 ALU × 4 元素）
+  - 组合索引（2 次 ALU × 4 元素）
+  - 查质心表（1 次常量内存读 × 4 元素）
+  - 乘范数（1 次乘法 × 4 元素）
+  总计：~2 次设备读 + 7 次 ALU + 4 次常量读 + 4 次乘法
+
+q8_0 反量化（每 4 个元素）：
+  - 读 4 个 int8（1 次设备内存读）
+  - 乘 scale（4 次乘法）
+  总计：~1 次设备读 + 4 次乘法
+```
+
+**turbo3 反量化计算量约是 q8_0 的 3-4 倍**，乘以所有缓存位置数，随 context 线性放大。
+
+短上下文时，turbo3 的内存带宽优势（KV Cache 小 2.3x）能覆盖额外计算开销；长上下文时，反量化计算量主导，带宽优势相对缩小。
+
+### 16.4 修复：优化反量化实现
+
+**根本原因**：原实现对同一个 qs/signs 字节读取 4 次（每元素读一次），改为**批量读取一次 + 循环展开**。
+
+**修复效果：**
+
+| Context | 修复前 turbo3/q8_0 | 修复后 turbo3/q8_0 |
+|---------|-----------------|-----------------|
+| 1024 | 0.976x | **0.981x** |
+| 2048 | 0.960x | **0.989x** |
+| 4096 | 0.921x | **0.981x** |
+| 8192 | — | **0.995x** |
+| 32768 | — | **0.995x** |
+
+**2K → 32K 全范围验证，比值稳定在 0.987x ~ 0.995x，退化趋势完全消除，质量（PPL）不受影响。**
+
+---
+
+## 17. 注意力门控优化（Attention-Gated Optimizations）
+
+> 来源：`docs/attention-gated-optimizations.md`
+
+**核心思路**：Flash Attention 计算过程中，注意力权重（`ss[]`）已经算出来了，可以用它来**门控后续计算**——权重极小的位置跳过对应计算，节省开销。
+
+### 17.1 四个候选优化点
+
+| 优化点 | 状态 | 结论 |
+|--------|------|------|
+| **Tile 级 V skip** | ❌ 已验证，不值得做 | MoE +0.6-0.9%，稠密模型 -0.8-1.1%。扫描 tile max（读 8 次 ss[]）的开销比节省的还多 |
+| **f16 路径 Sparse V** | ❌ 已验证，不值得做 | 短上下文 -0.3%，长上下文 +1.3%。f16 路径太便宜，分支开销抵消收益 |
+| **O 重缩放跳过** | ⏳ 仓库待实现 | `O = diag(ms)*O` 在 max 未变时（`ms ≈ 1.0`）是无效乘法，加 `if (|ms-1.0|>ε)` 门控。代码位置：`ggml-metal.metal` ~line 7298-7303。预期收益小，风险低但需注意浮点边界 |
+| **exp() 跳过** | ⏳ 仓库待实现 | `s-M < -20` 时 `exp(s-M) ≈ 2e-9 ≈ 0`，直接写 0 跳过 exp()。代码位置：`ggml-metal.metal` ~line 7291。exp() 在 GPU 上开销大，长上下文时大多数 score 远低于 max，预期收益中等，数学上完全等价 |
+
+### 17.2 已实现的 Sparse V（最重要）
+
+Sparse V 是已经落地的注意力门控优化，逻辑：
+
+```
+for each cached token position i:
+    if ss[i] < threshold τ:
+        skip V dequant and accumulate   ← 注意力权重极小，跳过
+    else:
+        dequant V[i] and accumulate     ← 正常处理
+```
+
+**实测效果**：
+- MoE 模型（Qwen3.5-35B-A3B）decode 速度 +22.8%
+- PPL 无影响（跳过的 token 注意力权重 < 1e-6）
+- 已提交 llama.cpp upstream PR #21119
