@@ -37,7 +37,7 @@ Qwen3.5 是混合架构（含 `full_attention` 和 GDN-based `linear_attention` 
 编译时 FX 图在以下算子处被切断，这些算子 eager 执行，不进入 CUDA Graph：
 
 ```python
-# vllm/config/compilation.py:717-730
+# vllm/config/compilation.py:747-762
 _attention_ops: ClassVar[list[str]] = [
     "vllm::unified_attention_with_output",      # 标准 FlashAttention
     "vllm::unified_mla_attention_with_output",   # MLA attention
@@ -46,22 +46,24 @@ _attention_ops: ClassVar[list[str]] = [
     "vllm::short_conv",                          # 短卷积
     "vllm::linear_attention",                    # 线性注意力
     "vllm::plamo2_mamba_mixer",                  # PLaMo2 Mamba
-    "vllm::gdn_attention_core",                  # GDN（Qwen3.5 的 linear attention）
+    "vllm::qwen_gdn_attention_core",             # GDN（Qwen3.5 的 linear attention）
+    "vllm::gdn_attention_core_xpu",              # GDN XPU 后端
     "vllm::olmo_hybrid_gdn_full_forward",        # OLMo hybrid GDN
     "vllm::kda_attention",                       # KDA attention
     "vllm::sparse_attn_indexer",                 # sparse attention
     "vllm::rocm_aiter_sparse_attn_indexer",      # ROCm sparse attention
+    "vllm::deepseek_v4_attention",               # DeepSeek V4 attention
 ]
 ```
 
-另外，在默认 piecewise 编译路径里、且 `use_inductor_graph_partition=False` 时，`vllm::unified_kv_cache_update` 也会被追加到 `splitting_ops` 中（`compilation.py:1088`）。这不是无条件行为；如果启用了 Inductor graph partition，这个说法未必成立。
+另外，在默认 piecewise 编译路径里、且 `use_inductor_graph_partition=False` 时，`vllm::unified_kv_cache_update` 和 `vllm::unified_mla_kv_cache_update` 也会被追加到 `splitting_ops` 中（`compilation.py:1139-1140`）。这不是无条件行为；如果启用了 Inductor graph partition，这个说法未必成立。
 
 **对 Qwen3.5 而言，涉及两个切割算子：**
 
 | 切割算子 | 对应层类型 |
 |---|---|
 | `vllm::unified_attention_with_output` | `full_attention` 层的 FlashAttention |
-| `vllm::gdn_attention_core` | `linear_attention` 层的 GDN 核心计算 |
+| `vllm::qwen_gdn_attention_core` | `linear_attention` 层的 GDN 核心计算 |
 
 ---
 
@@ -70,37 +72,37 @@ _attention_ops: ClassVar[list[str]] = [
 Prefill 和 decode 共享同一个入口，在运行时通过 `cudagraph_mode` 分流：
 
 ```
-GPUWorker.execute_model(scheduler_output)                    # gpu_worker.py:748
-  └─ GPUModelRunner.execute_model(scheduler_output)           # gpu_model_runner.py:3877
+GPUWorker.execute_model(scheduler_output)                    # gpu_worker.py
+  └─ GPUModelRunner.execute_model(scheduler_output)           # gpu_model_runner.py:3955
        │
-       ├─ [1] _determine_batch_execution_and_padding()        # :3548
-       │    ├─ _is_uniform_decode()                           # :3528
+       ├─ [1] _determine_batch_execution_and_padding()        # :3721
+       │    ├─ _is_uniform_decode()                           # :3701
        │    │    条件: max_num_scheduled_tokens == uniform_decode_query_len
        │    │          且 num_tokens == max_num_scheduled_tokens * num_reqs
        │    │    → True = decode,  False = prefill/mixed
        │    │
-       │    └─ cudagraph_dispatcher.dispatch()                 # :3593
+       │    └─ cudagraph_dispatcher.dispatch()                 # cudagraph_dispatcher.py:239
        │         根据 uniform_decode 标志匹配已捕获的 graph key
        │         → prefill: CUDAGraphMode.PIECEWISE
        │         → decode:  CUDAGraphMode.FULL
        │
-       ├─ [2] preprocess_mamba()                              # :3939
+       ├─ [2] preprocess_mamba()                              # :4117
        │    GDN 的 conv_state / ssm_state 拷贝和索引管理
        │    (完全在 graph 生命周期之外)
        │
-       ├─ [3] _build_attention_metadata()                     # :3973
+       ├─ [3] _build_attention_metadata()                     # :2183
        │    构造各 attention backend 的 metadata
        │
-       ├─ [4] _preprocess()                                   # :3996
+       ├─ [4] _preprocess()                                   # :3364
        │    准备 input_ids, positions, inputs_embeds
        │
-       └─ [5] set_forward_context(                            # :4020
+       └─ [5] set_forward_context(                            # :4214
        │         cudagraph_runtime_mode=mode,
        │         batch_descriptor=batch_desc,
        │         attn_metadata=attn_metadata)
        │    将 mode 和 metadata 写入全局 ForwardContext
        │
-       └─ [6] _model_forward(input_ids, positions, ...)       # :4038
+       └─ [6] _model_forward(input_ids, positions, ...)       # :3668
               → self.model(...)
               从此处开始，prefill 和 decode 路径分叉
 ```
@@ -117,56 +119,56 @@ self.model(input_ids, positions, ...)
 │  PIECEWISE ≠ FULL → 不匹配，直接透传 self.runnable(...)
 │                                                          # cuda_graph.py:244-254
 │
-└─ Qwen3_5ForCausalLM.forward()                            # qwen3_5.py:521
-   └─ Qwen3_5Model.__call__()                              # qwen3_5.py:207
+└─ Qwen3_5ForCausalLM.forward()                            # qwen3_5.py:500
+   └─ Qwen3_5Model.__call__()                              # qwen3_5.py:208
       │
-      │  被 @support_torch_compile 装饰                      # decorators.py:462
+      │  被 @support_torch_compile 装饰                      # decorators.py:502
       │  编译后的 FX 图被切成 N+1 个子图 (N = 层数)
       │
       │  ╔═══════════ 子图 0: PIECEWISE CUDAGraph ═══════════╗
       │  ║ CUDAGraphWrapper(PIECEWISE).__call__()            ║  # cuda_graph.py:233
-      │  ║   ├─ 首次: torch.cuda.graph() 捕获                ║  # :308
-      │  ║   └─ 后续: entry.cudagraph.replay()               ║  # :355
+      │  ║   ├─ 首次: torch.cuda.graph() 捕获                ║  # :313
+      │  ║   └─ 后续: entry.cudagraph.replay()               ║  # :360
       │  ║                                                    ║
       │  ║ 包含的算子:                                         ║
-      │  ║   embed_tokens(input_ids)             # :511       ║
-      │  ║   input_layernorm(hidden_states)      # :407-409   ║
+      │  ║   embed_tokens(input_ids)             # :516       ║
+      │  ║   input_layernorm(hidden_states)      # :410-414   ║
       │  ║   ┌ full_attention 层:                             ║
-      │  ║   │  qkv_proj(hidden_states)          # :287       ║
-      │  ║   │  q_norm / k_norm                  # :301-306   ║
-      │  ║   │  rotary_emb(positions, q, k)      # :308       ║
+      │  ║   │  qkv_proj(hidden_states)          # :292       ║
+      │  ║   │  q_norm / k_norm                  # :306-310   ║
+      │  ║   │  rotary_emb(positions, q, k)      # :313       ║
       │  ║   └ linear_attention(GDN) 层:                      ║
-      │  ║      in_proj_qkvz(hidden_states)      # gdn:538    ║
-      │  ║      in_proj_ba(hidden_states)         # gdn:539    ║
+      │  ║      in_proj_qkvz(hidden_states)      # gdn:923    ║
+      │  ║      in_proj_ba(hidden_states)         # gdn:924    ║
       │  ╚════════════════════════════════════════════════════╝
       │
       │  ┌─── 切割算子: eager 执行 (layer 0) ─────────────────┐
       │  │                                                      │
       │  │  ★ full_attention 层:                                │
-      │  │    Attention.forward()                # attn:440     │
+      │  │    Attention.forward()                # attn:437     │
       │  │    ├─ torch.ops.vllm.unified_kv_cache_update()       │
       │  │    │    └─ FlashAttentionImpl.do_kv_cache_update()    │
-      │  │    │                                  # attn:686     │
+      │  │    │                                  # attn:691     │
       │  │    └─ torch.ops.vllm.unified_attention_with_output() │
       │  │         └─ FlashAttentionImpl.forward()              │
       │  │              ├─ flash_attn_varlen_func()  (prefill)  │
       │  │              └─ flash_attn_with_kvcache()  (decode)  │
-      │  │                                  # flash_attn.py:673 │
+      │  │                                  # flash_attn.py:667 │
       │  │                                                      │
       │  │  ★ linear_attention(GDN) 层:                         │
-      │  │    torch.ops.vllm.gdn_attention_core()  # gdn:571   │
-      │  │    └─ GatedDeltaNetAttention._forward_core() # :779  │
-      │  │         ├─ causal_conv1d_fn()       (prefill)  # :876│
-      │  │         │  或 causal_conv1d_update() (decode)  # :889│
-      │  │         ├─ fused_post_conv_prep()              # :921│
-      │  │         ├─ chunk_gated_delta_rule()  (prefill)  # :978
+      │  │    torch.ops.vllm.qwen_gdn_attention_core() # gdn:956│
+      │  │    └─ QwenGatedDeltaNetAttention._forward_core()     │
+      │  │                                         # gdn:1261   │
+      │  │         ├─ causal_conv1d_fn()       (prefill)        │
+      │  │         │  或 causal_conv1d_update() (decode)        │
+      │  │         ├─ chunk_gated_delta_rule()  (prefill)       │
       │  │         │  └─ ChunkGatedDeltaRule.forward_native()   │
       │  │         │       └─ fla_chunk_gated_delta_rule()      │
       │  │         │     或 ChunkGatedDeltaRule.forward_cuda()  │
       │  │         │       └─ fi_chunk_gated_delta_rule()       │
       │  │         │  或 fused_sigmoid_gating_delta_rule_update()│
-      │  │         │                              (decode) # :997
-      │  │         └─ ssm_state 写回              # :992        │
+      │  │         │                              (decode)      │
+      │  │         └─ ssm_state 写回                            │
       │  └──────────────────────────────────────────────────────┘
       │
       │  ╔═══════════ 子图 1: PIECEWISE CUDAGraph ═══════════╗
@@ -174,15 +176,15 @@ self.model(input_ids, positions, ...)
       │  ║                                                    ║
       │  ║ 包含的算子:                                         ║
       │  ║   ┌ full_attention 层:                             ║
-      │  ║   │  attn_output_gate (sigmoid * gate)  # :312-314 ║
-      │  ║   │  o_proj(attn_output)                # :316     ║
+      │  ║   │  attn_output_gate (sigmoid * gate)  # :317-319 ║
+      │  ║   │  o_proj(attn_output)                # :321     ║
       │  ║   └ linear_attention(GDN) 层:                      ║
-      │  ║      norm(core_attn_out, z)             # gdn:586  ║
-      │  ║      out_proj(core_attn_out)            # gdn:589  ║
+      │  ║      norm(core_attn_out, z)             # gdn:866  ║
+      │  ║      out_proj(core_attn_out)            # gdn:869  ║
       │  ║                                                    ║
-      │  ║   post_attention_layernorm()            # :438     ║
-      │  ║   MLP: gate_up_proj → SiLU → down_proj  # :439    ║
-      │  ║   layer_scale (如启用)                   # :441-455 ║
+      │  ║   post_attention_layernorm()            # :443     ║
+      │  ║   MLP: gate_up_proj → SiLU → down_proj  # :444    ║
+      │  ║   layer_scale (如启用)                   # :446-458 ║
       │  ║                                                    ║
       │  ║   (下一层的 input_layernorm 和投影也融入此子图)      ║
       │  ╚════════════════════════════════════════════════════╝
@@ -197,7 +199,7 @@ self.model(input_ids, positions, ...)
       │  ║ 包含的算子:                                         ║
       │  ║   最后一层的 o_proj / out_proj                      ║
       │  ║   最后一层的 post_attention_layernorm + MLP          ║
-      │  ║   final norm (Qwen3_5RMSNorm)          # :536      ║
+      │  ║   final norm (Qwen3NextRMSNorm)                    ║
       │  ╚════════════════════════════════════════════════════╝
       │
       └─ return hidden_states
@@ -214,55 +216,55 @@ self.model(input_ids, positions, ...)
 │  读取 ForwardContext.cudagraph_runtime_mode = FULL
 │  FULL == FULL → 匹配!
 │                                                          # cuda_graph.py:233
-│  ├─ 首次: torch.cuda.graph() 捕获整个 forward             # :308
-│  └─ 后续: entry.cudagraph.replay()                       # :355
+│  ├─ 首次: torch.cuda.graph() 捕获整个 forward             # :313
+│  └─ 后续: entry.cudagraph.replay()                       # :360
 │       (单次 replay 执行整个 forward，接近零 CPU 开销)
 │
 │  ┌────────── 以下全部录进一个 FULL CUDA Graph ──────────┐
 │  │                                                        │
-│  │  Qwen3_5ForCausalLM.forward()           # qwen3_5:521 │
-│  │  └─ Qwen3_5Model.__call__()             # qwen3_5:207 │
+│  │  Qwen3_5ForCausalLM.forward()           # qwen3_5:500 │
+│  │  └─ Qwen3_5Model.__call__()             # qwen3_5:208 │
 │  │     │                                                  │
 │  │     │  @support_torch_compile 的 __call__               │
 │  │     │  内部 PIECEWISE wrapper 看到 runtime=FULL         │
 │  │     │  FULL ≠ PIECEWISE → 全部透传 runnable             │
-│  │     │                                   # cuda_graph:246│
+│  │     │                                   # cuda_graph:247│
 │  │     │                                                  │
-│  │     ├─ embed_tokens(input_ids)          # :511         │
+│  │     ├─ embed_tokens(input_ids)          # :516         │
 │  │     │                                                  │
 │  │     ├─ Layer 0 ~ N-1 (每层结构相同):                    │
 │  │     │  │                                               │
-│  │     │  ├─ input_layernorm()             # :407-409     │
+│  │     │  ├─ input_layernorm()             # :410-414     │
 │  │     │  │                                               │
 │  │     │  ├─ ★ full_attention 层:                         │
-│  │     │  │  qkv_proj(hidden_states)       # :287         │
-│  │     │  │  q_norm / k_norm               # :301-306     │
-│  │     │  │  rotary_emb(positions, q, k)   # :308         │
-│  │     │  │  Attention.forward()           # attn:440     │
-│  │     │  │    unified_kv_cache_update()   # attn:521     │
+│  │     │  │  qkv_proj(hidden_states)       # :292         │
+│  │     │  │  q_norm / k_norm               # :306-310     │
+│  │     │  │  rotary_emb(positions, q, k)   # :313         │
+│  │     │  │  Attention.forward()           # attn:437     │
+│  │     │  │    unified_kv_cache_update()   # attn:518     │
 │  │     │  │    unified_attention_with_output()             │
 │  │     │  │      └─ FlashAttentionImpl.forward()          │
 │  │     │  │           └─ flash_attn_with_kvcache()        │
-│  │     │  │                               # flash_attn:673│
-│  │     │  │  attn_output_gate()            # :312-314     │
-│  │     │  │  o_proj(attn_output)           # :316         │
+│  │     │  │                               # flash_attn:667│
+│  │     │  │  attn_output_gate()            # :317-319     │
+│  │     │  │  o_proj(attn_output)           # :321         │
 │  │     │  │                                               │
 │  │     │  ├─ ★ linear_attention(GDN) 层:                  │
-│  │     │  │  in_proj_qkvz(hidden_states)   # gdn:538      │
-│  │     │  │  in_proj_ba(hidden_states)     # gdn:539      │
-│  │     │  │  gdn_attention_core()          # gdn:571      │
-│  │     │  │    └─ _forward_core()          # gdn:779      │
-│  │     │  │         causal_conv1d_update()  # gdn:889     │
+│  │     │  │  in_proj_qkvz(hidden_states)   # gdn:923      │
+│  │     │  │  in_proj_ba(hidden_states)     # gdn:924      │
+│  │     │  │  qwen_gdn_attention_core()     # gdn:956      │
+│  │     │  │    └─ _forward_core()          # gdn:1261     │
+│  │     │  │         causal_conv1d_update()  (decode)      │
 │  │     │  │         fused_sigmoid_gating_delta_rule_update()│
-│  │     │  │                                # gdn:997      │
-│  │     │  │  norm(core_attn_out, z)        # gdn:586      │
-│  │     │  │  out_proj(core_attn_out)       # gdn:589      │
+│  │     │  │                                (decode)       │
+│  │     │  │  norm(core_attn_out, z)        # gdn:866      │
+│  │     │  │  out_proj(core_attn_out)       # gdn:869      │
 │  │     │  │                                               │
-│  │     │  ├─ post_attention_layernorm()     # :438         │
-│  │     │  ├─ MLP: gate_up_proj → SiLU → down_proj  # :439│
-│  │     │  └─ layer_scale (如启用)           # :441-455     │
+│  │     │  ├─ post_attention_layernorm()     # :443         │
+│  │     │  ├─ MLP: gate_up_proj → SiLU → down_proj  # :444│
+│  │     │  └─ layer_scale (如启用)           # :446-458     │
 │  │     │                                                  │
-│  │     └─ final norm                       # :536         │
+│  │     └─ final norm                       # :541         │
 │  │                                                        │
 │  └────────── 全部在一个 CUDA Graph 中 ──────────────────┘
 │
@@ -301,9 +303,8 @@ self.model(input_ids, positions, ...)
   │  in_proj_qkvz (MergedColumnParallelLinear → Q/K/V/Z)     │  ← 在 Graph 中
   │  in_proj_ba (MergedColumnParallelLinear → B/A)            │  ← 在 Graph 中
   ├──────────────────── 切割点 ──────────────────────────────┤
-  │  ★ gdn_attention_core:                                   │  ← 不在 Graph 中 (eager)
+  │  ★ qwen_gdn_attention_core:                               │  ← 不在 Graph 中 (eager)
   │    - causal_conv1d_fn / causal_conv1d_update (卷积)       │
-  │    - fused_post_conv_prep (后处理)                         │
   │    - chunk_gated_delta_rule (prefill 循环注意力)            │
   │      或 fused_sigmoid_gating_delta_rule_update (decode)   │
   │    - conv_state / ssm_state 读写                          │
@@ -327,8 +328,8 @@ self.model(input_ids, positions, ...)
 
 **不在 Graph 里的（切割点，针对当前 Qwen3.5 的 piecewise 路径）：**
 - **FlashAttention**：prefill 时序列长度变化，内部调度依赖动态 shape
-- **GDN 核心**：包含 conv1d 状态更新、循环注意力（chunk_gated_delta_rule）、ssm_state 读写等，涉及动态序列长度和状态管理
-- **KV cache 更新**：默认 piecewise 编译路径下会因字符串参数影响 Inductor 复用而被切出去；若启用 Inductor graph partition，行为可能不同
+- **GDN 核心（qwen_gdn_attention_core）**：包含 conv1d 状态更新、循环注意力（chunk_gated_delta_rule）、ssm_state 读写等，涉及动态序列长度和状态管理
+- **KV cache 更新**：默认 piecewise 编译路径下会因字符串参数影响 Inductor 复用而被切出去（`unified_kv_cache_update` + `unified_mla_kv_cache_update`）；若启用 Inductor graph partition，行为可能不同
 
 ---
 
@@ -357,36 +358,39 @@ Graph piece N:  layer(N-1) 后半 + final_norm
 
 | 操作 | 位置 | 说明 |
 |---|---|---|
-| `preprocess_mamba()` | `gpu_model_runner.py:3939` | GDN 的 conv_state/ssm_state 拷贝、索引管理 |
-| `_preprocess()` | `:3996` | input_ids, positions 等输入准备 |
-| `_build_attention_metadata()` | `:3973` | 构造各 backend 的 attn metadata |
-| `_determine_batch_execution_and_padding()` | `:3548` | batch 类型判断、padding |
-| `_get_slot_mappings()` | `:3962` | KV cache slot 映射 |
+| `preprocess_mamba()` | `gpu_model_runner.py:4117` | GDN 的 conv_state/ssm_state 拷贝、索引管理 |
+| `_preprocess()` | `:3364` | input_ids, positions 等输入准备 |
+| `_build_attention_metadata()` | `:2183` | 构造各 backend 的 attn metadata |
+| `_determine_batch_execution_and_padding()` | `:3721` | batch 类型判断、padding |
+| `_get_slot_mappings()` | `:3871` | KV cache slot 映射 |
 
 ---
 
 ## 9. CUDAGraphWrapper 的捕获/回放机制
 
 ```python
-# vllm/compilation/cuda_graph.py:233-356
+# vllm/compilation/cuda_graph.py:233-361
 class CUDAGraphWrapper:
     def __call__(self, *args, **kwargs):
-        mode = get_forward_context().cudagraph_runtime_mode
-        batch_desc = get_forward_context().batch_descriptor
+        forward_context = get_forward_context()
+        batch_descriptor = forward_context.batch_descriptor
+        cudagraph_runtime_mode = forward_context.cudagraph_runtime_mode
 
-        if mode == NONE or mode != self.runtime_mode:
+        if (cudagraph_runtime_mode == CUDAGraphMode.NONE
+            or cudagraph_runtime_mode != self.runtime_mode):
             # 不匹配 → 直接调用 runnable（透传）
             return self.runnable(*args, **kwargs)
 
-        entry = self.concrete_cudagraph_entries[batch_desc]
+        entry = self.concrete_cudagraph_entries[batch_descriptor]
 
         if entry.cudagraph is None:
             # ── 捕获 ──
             cudagraph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(cudagraph, pool=self.graph_pool):
+            with torch.cuda.graph(cudagraph, pool=self.graph_pool,
+                                  stream=current_stream()):
                 output = self.runnable(*args, **kwargs)
-            entry.cudagraph = cudagraph
             entry.output = weak_ref_tensors(output)
+            entry.cudagraph = cudagraph
             return output
         else:
             # ── 回放 ──
@@ -405,9 +409,9 @@ class CUDAGraphWrapper:
 ### 10.2 装饰器改造过程（初始化阶段）
 
 ```python
-# decorators.py:115-246
+# decorators.py:331 (内部实现 _support_torch_compile)
 @support_torch_compile(dynamic_arg_dims={"input_ids": 0, "positions": -1, ...})
-class Qwen3_5Model(Qwen3NextModel):
+class Qwen3_5Model(Qwen3NextModel):  # qwen3_5.py:198-208
     ...
 ```
 
@@ -423,7 +427,7 @@ class Qwen3_5Model(Qwen3NextModel):
            [1] 注入基类        [2] 替换 __init__     [3] 替换 __call__
 ```
 
-**[1] 注入基类** (`decorators.py:343`)
+**[1] 注入基类** (`decorators.py:347`)
 
 ```python
 cls.__bases__ = cls.__bases__ + (TorchCompileWithNoGuardsWrapper,)
@@ -431,7 +435,7 @@ cls.__bases__ = cls.__bases__ + (TorchCompileWithNoGuardsWrapper,)
 
 让 `Qwen3_5Model` 继承 `TorchCompileWithNoGuardsWrapper`，获得 `torch.compile` 能力。
 
-**[2] 替换 `__init__`** (`decorators.py:349-407`)
+**[2] 替换 `__init__`** (`decorators.py:353-410`)
 
 新的 `__init__` 在调用原始 `__init__` 之后，额外执行：
 
@@ -443,7 +447,7 @@ def __init__(self, *, vllm_config, prefix, **kwargs):
     if self.do_not_compile:
         return
 
-    # 调用 TorchCompileWithNoGuardsWrapper.__init__()     # wrapper.py:78
+    # 调用 TorchCompileWithNoGuardsWrapper.__init__()     # wrapper.py:72
     #   → 内部执行:
     #     backend = compilation_config.init_backend(vllm_config)  # 创建 VllmBackend
     #     self._compiled_callable = torch.compile(
@@ -457,7 +461,7 @@ def __init__(self, *, vllm_config, prefix, **kwargs):
 
 此时 `torch.compile()` 只是创建了一个惰性编译对象 `_compiled_callable`，**还没有真正编译**。
 
-**[3] 替换 `__call__`** (`decorators.py:462-632`)
+**[3] 替换 `__call__`** (`decorators.py:502-719`)
 
 ```python
 cls.__call__ = __call__   # 新的 __call__ 替代了 nn.Module 默认的 __call__
@@ -469,7 +473,7 @@ cls.__call__ = __call__   # 新的 __call__ 替代了 nn.Module 默认的 __call
 走的是被替换的 `__call__`：
 
 ```
-Qwen3_5Model.__call__(input_ids, positions, ...)           # decorators.py:462
+Qwen3_5Model.__call__(input_ids, positions, ...)           # decorators.py:502
 │
 ├─ [检查] self.do_not_compile?  → False（需要编译）
 ├─ [检查] self.compiled?        → False（第一次调用）
@@ -479,9 +483,9 @@ Qwen3_5Model.__call__(input_ids, positions, ...)           # decorators.py:462
 │    → torch._dynamo.mark_dynamic(input_ids, [0])
 │    → torch._dynamo.mark_dynamic(positions, [-1])
 │
-└─ TorchCompileWithNoGuardsWrapper.__call__(self, ...)      # wrapper.py:185
+└─ TorchCompileWithNoGuardsWrapper.__call__(self, ...)      # wrapper.py:169
    │
-   └─ self._compiled_callable(*args, **kwargs)              # :213
+   └─ self._compiled_callable(*args, **kwargs)              # :197
       │
       │  这是 torch.compile 包装过的函数
       │  首次调用 → 触发 Dynamo tracing + 后端编译
@@ -491,22 +495,22 @@ Qwen3_5Model.__call__(input_ids, positions, ...)           # decorators.py:462
       │    遇到 custom_op 节点：
       │      - vllm::unified_attention_with_output
       │      - vllm::unified_kv_cache_update
-      │      - vllm::gdn_attention_core
+      │      - vllm::qwen_gdn_attention_core
       │    这些 op 有 fake_impl，Dynamo 可以追踪穿过
       │
-      └─ [Backend] VllmBackend.__call__(graph, example_inputs)  # backends.py:981
+      └─ [Backend] VllmBackend.__call__(graph, example_inputs)  # backends.py:1015
          │
          │  ┌──────────────────────────────────────────────┐
-         │  │  VllmBackend 编译流程 (backends.py:981-1182)  │
+         │  │  VllmBackend 编译流程 (backends.py:1015+)     │
          │  └──────────────────────────────────────────────┘
          │
-         ├─ [1] split_graph(graph, splitting_ops)               # backends.py:1138
+         ├─ [1] split_graph(graph, splitting_ops)               # backends.py:548
          │    │  遍历 FX Graph 的每个节点
-         │    │  在 splitting_ops 处切断（split_graph, :532-606）
+         │    │  在 splitting_ops 处切断
          │    │    splitting_ops = [
          │    │      "vllm::unified_attention_with_output",
          │    │      "vllm::unified_kv_cache_update",
-         │    │      "vllm::gdn_attention_core",
+         │    │      "vllm::qwen_gdn_attention_core",
          │    │    ]
          │    │
          │    └─ 产出:
@@ -516,23 +520,23 @@ Qwen3_5Model.__call__(input_ids, positions, ...)           # decorators.py:462
          │           True  = attention/gdn 算子（不编译，eager 执行）
          │           False = 计算子图（需要 Inductor 编译）
          │
-         ├─ [2] PiecewiseCompileInterpreter.run()               # backends.py:706
+         ├─ [2] PiecewiseCompileInterpreter.run()               # backends.py:682
          │    │  遍历 split_gm 的每个子模块
          │    │
-         │    └─ call_module(target, args, kwargs)               # :709
+         │    └─ call_module(target, args, kwargs)
          │         │
          │         │  对于需要编译的子图 (not is_splitting_graph):
          │         │
-         │         ├─ PiecewiseBackend(submod, ...)              # :734
+         │         ├─ PiecewiseBackend(submod, ...)
          │         │    创建分片后端，内部调用 Inductor 编译子图
          │         │
-         │         └─ wrap_with_cudagraph_if_needed(             # :745
+         │         └─ wrap_with_cudagraph_if_needed(
          │              piecewise_backend, ...)
-         │            │                                          # backends.py:612
+         │            │                                          # backends.py:628
          │            │  检查 cudagraph_mode.has_piecewise_cudagraphs()
          │            │  → True（FULL_AND_PIECEWISE 模式下）
          │            │
-         │            └─ CUDAGraphWrapper(                       # :654
+         │            └─ CUDAGraphWrapper(
          │                 runnable=piecewise_backend,
          │                 runtime_mode=CUDAGraphMode.PIECEWISE
          │               )
@@ -553,13 +557,13 @@ Qwen3_5Model.__call__(input_ids, positions, ...)           # decorators.py:462
 ### 10.4 后续调用：编译完成后的运行路径
 
 ```
-Qwen3_5Model.__call__(input_ids, positions, ...)           # decorators.py:462
+Qwen3_5Model.__call__(input_ids, positions, ...)           # decorators.py:502
 │
 ├─ [检查] self.compiled?  → True
 │
-└─ TorchCompileWithNoGuardsWrapper.__call__(self, ...)      # wrapper.py:185
+└─ TorchCompileWithNoGuardsWrapper.__call__(self, ...)      # wrapper.py:169
    │
-   └─ self._compiled_callable(*args, **kwargs)              # :213
+   └─ self._compiled_callable(*args, **kwargs)              # :197
       │
       │  Dynamo 跳过 guard 检查（skip_all_guards_unsafe）
       │  直接执行缓存的 split_gm
@@ -584,9 +588,10 @@ Qwen3_5Model.__call__(input_ids, positions, ...)           # decorators.py:462
 以上是 `Qwen3_5Model` 内部的结构。在 `GPUModelRunner` 初始化时，还会在**外层再包一层**：
 
 ```python
-# gpu_model_runner.py:4892
+# gpu_model_runner.py:5189
 self.model = CUDAGraphWrapper(
     self.model,                       # ← Qwen3_5ForCausalLM（内含编译后的 Qwen3_5Model）
+    self.vllm_config,
     runtime_mode=CUDAGraphMode.FULL
 )
 ```
@@ -636,7 +641,7 @@ attention/gdn ops:
 ## 11. 启动时预捕获
 
 ```python
-# gpu_model_runner.py:6001
+# gpu_model_runner.py:6373
 def capture_model():
     for runtime_mode, batch_descs in cudagraph_dispatcher.get_capture_descs():
         # 先捕获 PIECEWISE（prefill/mixed），再捕获 FULL（decode）
@@ -683,41 +688,43 @@ def _warmup_and_capture(desc, mode):
 
 | 功能 | 文件 | 行号 |
 |---|---|---|
-| CUDAGraphMode 定义 | `vllm/config/compilation.py` | 53-103 |
-| splitting_ops 列表 | `vllm/config/compilation.py` | 717-730 |
-| CUDAGraphWrapper | `vllm/compilation/cuda_graph.py` | 145-357 |
-| @support_torch_compile | `vllm/compilation/decorators.py` | 115-246, 462 |
-| GPUWorker.execute_model | `vllm/v1/worker/gpu_worker.py` | 748 |
-| GPUModelRunner.execute_model | `vllm/v1/worker/gpu_model_runner.py` | 3877 |
-| _is_uniform_decode | `vllm/v1/worker/gpu_model_runner.py` | 3528 |
-| _determine_batch_execution_and_padding | `vllm/v1/worker/gpu_model_runner.py` | 3548 |
-| _model_forward | `vllm/v1/worker/gpu_model_runner.py` | 3495 |
-| capture_model | `vllm/v1/worker/gpu_model_runner.py` | 6001 |
-| CudagraphDispatcher | `vllm/v1/cudagraph_dispatcher.py` | 234-323 |
-| ForwardContext | `vllm/forward_context.py` | 205 |
-| Qwen3_5Model | `vllm/model_executor/models/qwen3_5.py` | 207 |
-| Qwen3_5DecoderLayer | `vllm/model_executor/models/qwen3_5.py` | 118 |
-| Qwen3NextDecoderLayer.forward | `vllm/model_executor/models/qwen3_next.py` | 398 |
-| Qwen3NextAttention.forward | `vllm/model_executor/models/qwen3_next.py` | 281 |
-| Attention.forward | `vllm/model_executor/layers/attention/attention.py` | 440 |
-| unified_attention_with_output | `vllm/model_executor/layers/attention/attention.py` | 729 |
-| unified_kv_cache_update | `vllm/model_executor/layers/attention/attention.py` | 686 |
-| FlashAttentionImpl.forward | `vllm/v1/attention/backends/flash_attn.py` | 673 |
-| GatedDeltaNetAttention | `vllm/model_executor/layers/mamba/gdn_linear_attn.py` | 217 |
-| GatedDeltaNetAttention.forward_cuda | `vllm/model_executor/layers/mamba/gdn_linear_attn.py` | 513 |
-| gdn_attention_core (custom op) | `vllm/model_executor/layers/mamba/gdn_linear_attn.py` | 1087 |
-| _forward_core | `vllm/model_executor/layers/mamba/gdn_linear_attn.py` | 779 |
-| ChunkGatedDeltaRule | `vllm/model_executor/layers/mamba/gdn_linear_attn.py` | 120 |
+| CUDAGraphMode 定义 | `vllm/config/compilation.py` | 53-100 |
+| splitting_ops 列表 | `vllm/config/compilation.py` | 747-762 |
+| CUDAGraphWrapper | `vllm/compilation/cuda_graph.py` | 145-361 |
+| @support_torch_compile | `vllm/compilation/decorators.py` | 331-719 |
+| GPUWorker.execute_model | `vllm/v1/worker/gpu_worker.py` | 841 |
+| GPUModelRunner.execute_model | `vllm/v1/worker/gpu_model_runner.py` | 3955 |
+| _is_uniform_decode | `vllm/v1/worker/gpu_model_runner.py` | 3701 |
+| _determine_batch_execution_and_padding | `vllm/v1/worker/gpu_model_runner.py` | 3721 |
+| _model_forward | `vllm/v1/worker/gpu_model_runner.py` | 3668 |
+| capture_model | `vllm/v1/worker/gpu_model_runner.py` | 6373 |
+| CudagraphDispatcher | `vllm/v1/cudagraph_dispatcher.py` | 15-328 |
+| CudagraphDispatcher.dispatch | `vllm/v1/cudagraph_dispatcher.py` | 239-328 |
+| ForwardContext | `vllm/forward_context.py` | 129 |
+| BatchDescriptor | `vllm/forward_context.py` | 30 |
+| Qwen3_5Model | `vllm/model_executor/models/qwen3_5.py` | 208 |
+| Qwen3_5DecoderLayer | `vllm/model_executor/models/qwen3_5.py` | 120 |
+| Qwen3NextDecoderLayer.forward | `vllm/model_executor/models/qwen3_next.py` | 403 |
+| Qwen3NextAttention.forward | `vllm/model_executor/models/qwen3_next.py` | 286 |
+| Attention.forward | `vllm/model_executor/layers/attention/attention.py` | 437 |
+| unified_attention_with_output | `vllm/model_executor/layers/attention/attention.py` | 734 |
+| unified_kv_cache_update | `vllm/model_executor/layers/attention/attention.py` | 691 |
+| FlashAttentionImpl.forward | `vllm/v1/attention/backends/flash_attn.py` | 667 |
+| QwenGatedDeltaNetAttention | `vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py` | 420 |
+| QwenGatedDeltaNetAttention.forward_cuda | `vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py` | 908 |
+| qwen_gdn_attention_core (custom op) | `vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py` | 1647-1703 |
+| _forward_core | `vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py` | 1261 |
+| GatedDeltaNetAttention (base) | `vllm/model_executor/layers/mamba/gdn/base.py` | 22 |
 | **编译链路** | | |
-| _support_torch_compile（装饰器实现） | `vllm/compilation/decorators.py` | 325-632 |
-| 替换 __init__ | `vllm/compilation/decorators.py` | 349-407 |
-| 替换 __call__（首次编译 + 后续调用） | `vllm/compilation/decorators.py` | 462-632 |
-| TorchCompileWithNoGuardsWrapper | `vllm/compilation/wrapper.py` | 47-298 |
-| TorchCompileWithNoGuardsWrapper.__init__（torch.compile 创建） | `vllm/compilation/wrapper.py` | 78-174 |
-| TorchCompileWithNoGuardsWrapper.__call__（运行时入口） | `vllm/compilation/wrapper.py` | 185-215 |
-| VllmBackend（编译后端） | `vllm/compilation/backends.py` | 784 |
-| VllmBackend.__call__（Dynamo 回调入口） | `vllm/compilation/backends.py` | 981 |
-| split_graph（FX 图切割） | `vllm/compilation/backends.py` | 532-606 |
-| PiecewiseCompileInterpreter（子图编译 + wrapper 包装） | `vllm/compilation/backends.py` | 666-755 |
-| wrap_with_cudagraph_if_needed（子图包装 PIECEWISE wrapper） | `vllm/compilation/backends.py` | 612-663 |
-| 外层 FULL wrapper 包装 | `vllm/v1/worker/gpu_model_runner.py` | 4892 |
+| _support_torch_compile（装饰器实现） | `vllm/compilation/decorators.py` | 331-719 |
+| 替换 __init__ | `vllm/compilation/decorators.py` | 353-410 |
+| 替换 __call__（首次编译 + 后续调用） | `vllm/compilation/decorators.py` | 502-719 |
+| TorchCompileWithNoGuardsWrapper | `vllm/compilation/wrapper.py` | 47 |
+| TorchCompileWithNoGuardsWrapper.__init__（torch.compile 创建） | `vllm/compilation/wrapper.py` | 72 |
+| TorchCompileWithNoGuardsWrapper.__call__（运行时入口） | `vllm/compilation/wrapper.py` | 169 |
+| VllmBackend（编译后端） | `vllm/compilation/backends.py` | 800 |
+| VllmBackend.__call__（Dynamo 回调入口） | `vllm/compilation/backends.py` | 1015 |
+| split_graph（FX 图切割） | `vllm/compilation/backends.py` | 548 |
+| PiecewiseCompileInterpreter（子图编译 + wrapper 包装） | `vllm/compilation/backends.py` | 682 |
+| wrap_with_cudagraph_if_needed（子图包装 PIECEWISE wrapper） | `vllm/compilation/backends.py` | 628 |
+| 外层 FULL wrapper 包装 | `vllm/v1/worker/gpu_model_runner.py` | 5189 |
