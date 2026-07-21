@@ -1,0 +1,450 @@
+# NVIDIA Blackwell GPU 上基于 Cluster Launch Control（CLC）的动态持久化 tile 调度
+
+> 来源：<https://research.colfax-intl.com/dynamic-persistent-tile-scheduling-with-cluster-launch-control-clc-on-nvidia-blackwell-gpus/>
+>
+> 发布于 2026 年 5 月 9 日 · Colfax Research · 文章 / 博客 / 教程
+
+### 动机
+
+考虑矩阵乘法（GEMM）问题
+
+$$C = AB,$$
+
+其中 $A \in \mathbb{R}^{M\times K}$、$B \in \mathbb{R}^{K\times N}$、$C \in \mathbb{R}^{M\times N}$。C 的计算通过把问题形状 (M, N, K) 按某个 tile 形状 (bM, bN, bK) 切分来并行化，每个 bM × bN 的输出 tile 计算为
+
+$$C^{[i,j]} = \sum_k A^{[i,k]} B^{[k,j]}.$$
+
+每个 **work tile（工作块）** $C^{[i,j]}$ 都必须被分配给某个处理器——具体来说，是 CUDA 执行模型中的一个 CTA 或一个 CTA cluster。**tile 调度（tile scheduling）** 问题就是要确定如何把这一组 work tile 最优地分配到各处理器上。
+
+本文讨论 **Cluster Launch Control**（CLC），这是 NVIDIA Blackwell GPU 上一项由硬件支持的特性，用于实现最优的 tile 调度，尤其是在**负载均衡（load balancing）**方面。为了给出背景，我们先回顾几种常见的调度策略，以及 CLC 所要解决的这些策略的不足。接着我们逐行讲解在 CuTe DSL kernel 中使用 CLC 的实现细节，最后以一个 GEMM kernel 的性能对比收尾。
+
+### 单 tile 调度（Single Tile Scheduling）
+
+最朴素的 tile 调度选择，是启动一个形状为 (M/bM, N/bN) 的 cluster 网格，并把每个 work tile 分配给唯一的一个 cluster。这对负载均衡是有利的：网格中的 cluster 数量多于 SM 组的数量，因此每当一个 cluster 退出时，硬件调度器就会把一个排队中的 cluster 派发到刚空闲下来的 SM 组上。然而，这种策略整体上往往并不是最优的，因为每个 cluster 都要付出固定的启动开销——流水线初始化、descriptor 设置等等——而这些开销只被摊销到单个 tile 上。此外，采用单 tile 调度时，我们无法在多个 work tile 之间做重叠来隐藏延迟，例如把一个 work tile 的 epilogue 与另一个 work tile 的 mainloop 重叠。
+
+### 静态持久化 tile 调度（Static Persistent Tile Scheduling）
+
+另一方面，我们也可以选择采用持久化（persistent）的 tile 调度方案。这里我们简要回顾一下持久化 tile 调度的概念，更详细的阐述请读者参阅我们的[前一篇文章](https://research.colfax-intl.com/cutlass-tutorial-persistent-kernels-and-stream-k/)。
+
+在持久化的设定下，我们启动的网格所包含的 cluster 数量，等于 GPU 上能够并发调度的 cluster 数量。此时，一旦某个 cluster 被启动，它就会“持久地（persist）”驻留在 GPU 上，计算某一组 work tile。例如，给定 148 个 SM、cluster 大小为 2，我们就可以在 GPU 上并发启动 74 个 cluster。如果我们启动一个包含 512 个 work tile 的 GEMM kernel，那么我们可以为这些 work tile 选定某种线性顺序，让每个 cluster 计算其中每隔 74 个的那一个 work tile。
+
+![GEMM 的输出 C 被切分为 5 × 6 的 work tile 网格，每个 tile 由八个 cluster 之一计算；分配给 cluster 0 的 tile 被高亮标出](images/fig01_static_persistent_partition.png)
+
+*图 1：GEMM 的输出 C 被切分成 5 × 6 的 work tile 网格，每个 tile 都由八个 cluster 之一来计算。每个 work tile 都标注了分配给它的 cluster 编号。分配给 cluster 0 的 work tile 被高亮显示。*
+
+持久化 tile 调度的主要好处在于，我们可以把一个 tile 的 epilogue 与下一个 tile 的 mainloop 重叠；同时我们也避免了启动新 cluster 的延迟。然而，静态持久化 tile 调度会带来负载不均衡的问题。例如，考虑一个 grouped GEMM，它计算一组 GEMM：
+
+$$C_i = A_i B_i, \quad i = 0, 1, \dots, \texttt{num\_problems} - 1.$$
+
+举个例子，我们可以考虑一个由四个问题组成的 grouped GEMM，其形状如下：
+
+|  |  |
+| --- | --- |
+| 问题 0： | (256, 256, 128) |
+| 问题 1： | (256, 256, 2048) |
+| 问题 2： | (256, 256, 128) |
+| 问题 3： | (256, 256, 2048) |
+
+注意每个 GEMM 都有 M = N = 256，但缩并维度（contracting dimension）对某些问题较小（K = 128），对另一些问题较大（K = 2048）。考虑一个使用以下 tile 形状来计算该 grouped GEMM 的 kernel：
+
+$$(\text{bM}, \text{bN}, \text{bK}) = (128, 128, 128).$$
+
+如果 GPU 上有足够的可用资源来并发启动 8 个 cluster，我们可能会按下图所示把 work tile 分配给各 cluster。
+
+![grouped GEMM 中的每个 work tile 被分配给八个 cluster 之一：把所有 tile 线性排序后，每隔 8 个 tile 分配给一个 cluster](images/fig02_static_assignment.png)
+
+*图 2：我们的 grouped GEMM 中的每个 work tile 都被分配给八个 cluster 之一。在静态持久化的情形下，分配方式是：把所有问题的 work tile 线性排序，然后每隔 8 个 work tile 分配给一个 cluster。*
+
+乍看之下，这种分配似乎是完美均衡的，因为每个 cluster 恰好计算两个 work tile。然而，这些 work tile 所需的计算量因问题而异。来自问题 0 和问题 2 的 work tile 需要
+
+$$2 * \text{bM} * \text{bN} * K = 2 * 2^7 * 2^7 * 2^7 = 2^{22} \text{ FLOPs},$$
+
+而来自问题 1 和问题 3 的 work tile 需要
+
+$$2 * \text{bM} * \text{bN} * K = 2 * 2^7 * 2^7 * 2^{11} = 2^{26} \text{ FLOPs}.$$
+
+因此，如果我们看每个 cluster 所计算的 FLOP 数量，就会发现显著的负载不均衡：
+
+![静态持久化情形下每个 cluster 所完成的工作（以计算的 FLOP 数量衡量），呈现出明显的不均衡](images/fig03_static_flops_imbalance.png)
+
+*图 3：静态持久化情形下每个 cluster 所完成工作量的示意（以计算的 FLOP 数量衡量）。*
+
+这种不均衡促使我们转向动态持久化调度。
+
+### 动态持久化 tile 调度（Dynamic Persistent Tile Scheduling）
+
+在这种调度方案中，每个 cluster 会先计算某个初始 work tile，然后只要还有可用的 work tile，就继续获取并处理新的 work tile。让我们看看这如何避免前面例子中出现的负载不均衡。在一个合理的假设下——即 cluster 处理来自问题 0 或 2 的 tile 所需的时间，远小于处理来自问题 1 或 3 的 tile 所需的时间——work tile 到 cluster 的分配可能会呈现如下形态：
+
+![在动态持久化情形下，每个 cluster 先拿到一个初始 tile，随后在完成当前工作时再去获取新的 tile](images/fig04_dynamic_assignment.png)
+
+*图 4：我们的 grouped GEMM 中的每个 work tile 都被分配给八个 cluster 之一。在动态持久化的情形下，分配方式是：把所有问题的 work tile 线性排序，给每个 cluster 分配一个初始 work tile，然后允许各 cluster 在完成当前工作后再去获取新的 work tile。*
+
+注意，除了初始分配之外，程序员无法控制哪些 work tile 由哪些 cluster 来计算。这些分配是在运行时根据各 cluster 完成其工作的先后顺序来决定的。我们看到，在这种情形下，各 cluster 计算的 FLOP 数量分布得更加均匀。
+
+![动态持久化情形下每个 cluster 所完成的工作（以计算的 FLOP 数量衡量），分布更加均匀](images/fig05_dynamic_flops.png)
+
+*图 5：动态持久化情形下每个 cluster 所完成工作量的示意（以计算的 FLOP 数量衡量）。*
+
+这种改善后的负载均衡带来了更好的 kernel 性能。例如，我们可以对如下问题形状的 grouped GEMM 做基准测试：
+
+|  |  |
+| --- | --- |
+| 问题 0： | (1024, 1024, 1024) |
+| 问题 1： | (1024, 1024, K) |
+| 问题 2： | (1024, 1024, 1024) |
+| 问题 3： | (1024, 1024, K) |
+
+在我们的 B200 上，让 K 取越来越大的值（B200 可并发支持 74 个形状为 (2, 1) 的 cluster）。静态与动态两种情形下的结果如下所示。
+
+![高度负载不均衡的 grouped GEMM 在静态与动态调度下的性能；随着不均衡加剧，动态调度显著优于静态调度](images/fig06_static_vs_dynamic_perf.png)
+
+*图 6：高度负载不均衡的 grouped GEMM 在静态与动态调度下的性能。所测配置的操作数数据类型为 mxfp4、MMA tile 大小为 256 × 128，使用 2CTA MMA 指令。*
+
+正如预期的那样，当 work tile 变得高度负载不均衡时，动态调度器显著优于静态调度器。
+
+#### 动态持久化 tile 调度的标准实现
+
+要实现动态持久化 tile 调度，我们需要保证两条性质：
+
+1. 每个 tile 最终都会被某个 cluster 处理，且
+2. 没有任何 tile 会被超过一个 cluster 处理。
+
+一种标准策略是维护一个全局原子计数器（即信号量锁），用它来追踪下一个尚未分配的 tile。当某个 cluster 完成它当前的 tile 时，它对这个计数器执行原子的 fetch-and-increment（取值并自增），以此认领下一个 tile 索引。每个 cluster 会持续请求工作，直到返回的 tile 索引大于等于 tile 总数为止，从而保证性质 (1)。由于原子操作是可线性化的（linearizable），每个 cluster 都会拿到唯一的 tile 索引，从而保证性质 (2)。这一策略的一个实现例子见 [quack tile scheduler](https://github.com/Dao-AILab/quack/blob/d898157f6761759161c48af94be1332dfd00697e/quack/tile_scheduler.py#L393)。
+
+尽管这种做法简单且与架构无关，它也并非没有缺点。所有 cluster 都必须反复对同一个全局计数器执行原子操作。这在 cluster 之间引入了一定程度的串行化，并且需要反复往返访问全局内存。此外，在每次 kernel 启动之前，还必须把这个全局计数器清零。
+
+幸运的是，Blackwell 提供了一种由硬件支持的动态持久化调度实现，称为 **Cluster Launch Control**（CLC）。它在软件侧简化了动态持久化调度的实现，还带来了若干其他好处，我们会在本文余下部分逐一介绍。
+
+## Blackwell 的 Cluster Launch Control（CLC）
+
+CLC 是从 Blackwell 架构开始提供的、由硬件支持的动态持久化 tile 调度版本。它最初提交的启动网格与单 tile 调度器的网格完全相同（即由问题的 work tile 数量决定——参见后文讲解中对 `_compute_grid` 的讨论），但第一波活跃的 cluster 会反复尝试“窃取（steal）”那些尚未启动的 cluster 的工作——取消它们的启动，取得它们的 tile 坐标，然后自行完成这些工作。因此，第一波 cluster 最终可能会持久驻留并完成所有工作，而网格中的其他 cluster 可能永远不会真正启动。另一方面，CLC 还具备灵活性：它可以动态地允许某些 cluster 在尚未完成所有 tile 的情况下退出，之后再启动新的 cluster 来继续处理这个问题（参见“CLC 与并发 kernel 及抢占”一节）。我们先考察与 CLC 相关的 PTX 指令，然后逐行讲解 NVIDIA 的 [CLC CuTeDSL 示例](https://github.com/NVIDIA/cutlass/blob/ae6bccf341fb4410241f696ba06873023d5ce4ed/examples/python/CuTeDSL/cute/blackwell/kernel/dense_gemm/dense_gemm_persistent_dynamic.py)，最后报告一个对比 CLC、静态持久化调度和单 tile 调度的实验。
+
+我们参考的资料包括以下几项：
+
+* [PTX 文档](https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-clusterlaunchcontrol-try-cancel)
+* [NVIDIA CUDA 编程指南第 4.12 节](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/cluster-launch-control.html)
+* [NVIDIA CUTLASS 文档](https://docs.nvidia.com/cutlass/latest/media/docs/cpp/blackwell_cluster_launch_control.html)
+
+### PTX 指令 —— `try_cancel` 与 `query_cancel`
+
+在 PTX 层面，用于实现 CLC 逻辑的主要有两组指令。第一组是 `clusterlaunchcontrol.try_cancel`，它发出一个原子请求，去取消一个尚未启动的 cluster，并在响应中获得一些经过编码的数据。随后可以用 `clusterlaunchcontrol.query_cancel` 来解码这些数据，判断取消是否成功；如果成功，就得到被取消 cluster 的 tile 坐标，以便“窃取”过来。
+
+`clusterlaunchcontrol.try_cancel` 的语法如下：
+
+```
+clusterlaunchcontrol.try_cancel.async{.space}.completion_mechanism{.multicast::cluster::all}.b128 [addr], [mbar];
+
+.completion_mechanism = { .mbarrier::complete_tx::bytes };
+.space = { .shared::cta };
+```
+
+这条指令在很多方面都可以与 [TMA](https://research.colfax-intl.com/tutorial-hopper-tma/) 类比：
+
+* 与 TMA 一样，应当只有一个线程发起 `try_cancel` 操作。不过，在 TMA multicast 中是每个参与的 CTA 有一个线程发出 TMA 指令，而对 `try_cancel` 而言应当是每个 cluster 只用一个线程。特别地，如果有多个线程提交 `try_cancel`，就会导致多个 cluster 被取消。
+* 与 TMA 一样，这个操作会异步地把一些数据写入 SMEM（写到 `[addr]` 所指定的地址）。这些数据如果做 multicast，就必须 multicast 到 cluster 中的所有 CTA；而 TMA 则可以选择 cluster 的一个子集来做数据的 multicast（例如只发给 cluster 中同一行或同一列的 CTA）。
+  * 对于包含多个 CTA 的非平凡（nontrivial）cluster，如果 `try_cancel` 不做 multicast，那么发起该指令的 warp 就需要先从 SMEM 读取响应数据块，计算出 tile 坐标信息，再把它写回 SMEM，以便 cluster 中其他 CTA 读取结果。在计算 work tile 信息比较复杂的情况下，这种做法可能更高效。
+* 与 TMA 一样，我们使用一个事务屏障（transaction barrier）来追踪 `try_cancel` 操作的完成。不过，任何一次 `try_cancel` 操作都总是传输 16 字节。
+* 作为一个 cluster 级别的操作，我们应当注意：在发出带 multicast 的 `try_cancel` 时，要确保 cluster 中没有任何其他 CTA 已经退出，以避免未定义行为。
+
+`clusterlaunchcontrol.query_cancel` 的语法如下：
+
+```
+clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 pred, try_cancel_response;
+
+clusterlaunchcontrol.query_cancel.get_first_ctaid.v4.b32.b128 {xdim, ydim, zdim, _},  try_cancel_response;
+
+clusterlaunchcontrol.query_cancel.get_first_ctaid{::dimension}.b32.b128 reg, try_cancel_response;
+
+::dimension = { ::x, ::y, ::z };
+```
+
+我们按如下方式使用这些指令：
+
+* 在观察到 `try_cancel` 完成之后，我们可以针对 `try_cancel` 指令返回的 16 字节数据发出 `query_cancel` 类指令。注意，PTX 文档将这些数据描述为“opaque（不透明的）”，编程指南则称其为“encoded（经过编码的）”，这意味着 `query_cancel` 是从这些数据中获取有用信息的唯一途径。
+* `.is_canceled` 给出一个谓词（predicate），指示所请求的取消是否成功。注意，如果 `.is_canceled` 返回 false，那么再发出除 `.is_canceled` 之外的其他 `query_cancel` 指令会导致未定义行为，所以我们应当总是先从 `.is_canceled` 开始。
+  * 进一步注意，如果某个 CTA 已经观察到某次 `try_cancel` 失败（即 `.is_canceled` 返回 false），那么再发出另一次 `try_cancel` 同样会导致未定义行为。因此，在观察到这种失败之后，该 CTA 就不能再使用 CLC，应当在耗尽其当前工作队列后退出。
+  * `try_cancel` 失败通常并不表示出错，而是调度逻辑的一部分——最常见的失败原因是网格中已经没有剩余的 cluster 可供执行。
+* `.get_first_ctaid` 可用于获取被取消 cluster 中第一个 CTA 的网格坐标：用 `.v4` 可获取坐标的全部三个维度（向量中第四个元素的内容未作规定），或用 `::dimension` 指定某个特定维度。
+
+### CLC 实现讲解（CuTeDSL 示例）
+
+Blackwell 的 CuTeDSL 示例 [dense_gemm_persistent_dynamic.py](https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/cute/blackwell/kernel/dense_gemm/dense_gemm_persistent_dynamic.py) 实现了一个标准的 dense GEMM，其中 CLC 的 `try_cancel` 由每个 cluster 中的单个调度器 warp（scheduler warp）执行，而该 warp 与 cluster 中其他 warp 之间的通信则由一个 CLC pipeline 来处理。kernel 为每个 CTA 启动的 warp 的编号，可以在 `__init__` 方法中看到：
+
+```python
+self.epilogue_warp_id = (0, 1, 2, 3)
+self.mma_warp_id = 4
+self.tma_warp_id = 5
+self.sched_warp_id = 6
+```
+
+首先，在 `__call__` 方法中，我们展示 kernel 启动参数所用的 grid 变量是如何通过 `_compute_grid` 确定的：
+
+```python
+def __call__(...):
+    ...
+    # 计算 grid 大小
+    self.tile_sched_params, grid = self._compute_grid(
+            c, self.cta_tile_shape_mnk, self.cluster_shape_mn
+    )
+    self.kernel(...).launch(
+        grid=grid,
+        block=[self.threads_per_cta, 1, 1],
+        cluster=(*self.cluster_shape_mn, 1),
+        stream=stream,
+     )
+```
+
+```python
+def _compute_grid(
+    c: cute.Tensor,
+    cta_tile_shape_mnk: Tuple[int, int, int],
+        cluster_shape_mn: Tuple[int, int],
+    ) -> Tuple[utils.ClcDynamicPersistentTileSchedulerParams, Tuple[int, int, int]]:
+    """使用持久化 tile 调度器为输出张量 C 计算 grid 大小。
+    :param c: 输出张量 C
+    :param cta_tile_shape_mnk: CTA tile 的形状 (M, N, K)。
+    :param cluster_shape_mn: 每个 cluster 在 M、N 维度上的形状。
+    :return: 一个元组，包含：
+        - tile_sched_params: 持久化 tile 调度器的参数。
+        - grid: kernel 启动所用的 grid 形状。
+    """
+    c_shape = cute.slice_(cta_tile_shape_mnk, (None, None, 0))
+    gc = cute.zipped_divide(c, tiler=c_shape)
+    num_ctas_mnl = gc[(0, (None, None, None))].shape
+    cluster_shape_mnl = (*cluster_shape_mn, 1)
+
+    tile_sched_params = utils.ClcDynamicPersistentTileSchedulerParams(
+        num_ctas_mnl, cluster_shape_mnl
+    )
+    # 会向上取整到整数个 cluster
+    grid = utils.ClcDynamicPersistentTileScheduler.get_grid_shape(tile_sched_params)
+    return tile_sched_params, grid
+```
+
+`cta_tile_shape_mnk` 在前面定义，它由 MMA tiler 推导得到，其方式统一地同时支持 1CTA 和 2CTA 两种 MMA 模式：
+
+```python
+self.cta_tile_shape_mnk = (
+    self.mma_tiler[0] // cute.size(tiled_mma.thr_id.shape),
+    self.mma_tiler[1],
+    self.mma_tiler[2],
+)
+```
+
+grid 的计算随后用 CTA tiler 对 C 做切分，得到一个初步的 grid 形状，再按 cluster 形状向上取整，以满足网格必须能被 cluster 整除的要求。这一计算与单 tile 调度器的计算完全相同，特别是它并不涉及 SM 的数量。
+
+接下来，我们考察 CLC pipeline。与其他标准 GEMM pipeline 一起，CLC pipeline 在 kernel 调用的开头附近被创建。
+
+```python
+# 初始化 clc_pipeline（barrier）及其 states
+clc_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
+cluster_size = cute.size(self.cluster_shape_mn)
+# 每个 CTA 有 4 个 epilogue warp + 1 个 MMA warp + 1 个 TMA warp
+# 每个 cluster 有 1 个 scheduler warp
+num_clc_consumer_threads = 32 * (
+    1 + cluster_size * (1 + len(self.epilogue_warp_id) + 1)
+)
+clc_pipeline_consumer_group = pipeline.CooperativeGroup(
+    pipeline.Agent.Thread, num_clc_consumer_threads
+)
+clc_pipeline = pipeline.PipelineClcFetchAsync.create(
+    barrier_storage=storage.clc_mbar_ptr.data_ptr(),
+    num_stages=self.num_clc_stage, # 本示例中为 1
+    producer_group=clc_pipeline_producer_group,
+    consumer_group=clc_pipeline_consumer_group,
+    tx_count=self.num_clc_response_bytes, # 16
+    cta_layout_vmnk=cluster_layout_vmnk,
+    defer_sync=True,
+)
+```
+
+我们来解释第 6-8 行中 `num_clc_consumer_threads` 是怎么算出来的。cluster 中所有 CTA 的 TMA、MMA 和 epilogue warp 都需要知道正确的 work tile 坐标（以及取消是否成功），才能知道该在哪里执行各自的任务，这就给出了 `cluster_size * (1 + len(self.epilogue_warp_id) + 1)`。scheduler warp 自身也是一个 consumer，因为它同样需要知道自己的取消请求是否失败——这将是它退出的信号，因此还需额外加 1。注意，由于所有 CTA 都启动相同数量的 warp，cluster 中非 leader 的 CTA 也会启动一个“scheduler” warp，但这些 warp 不做任何工作，既不是 CLC pipeline 的 consumer，也不是其 producer。cluster 中的 scheduler warp 是 CLC pipeline 唯一的 producer。
+
+在创建 CLC pipeline 的代码稍上方，我们还能看到为 CLC 操作与通信所分配的共享内存。
+
+```python
+class SharedStorage:
+    # ... （用于 TMA load、acc 和 TMEM 的 mbarrier 的存储）
+    clc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2] # 一个 empty、一个 full mbarrier（pipeline 只有一个 stage）
+    clc_response: cute.struct.MemRange[cutlass.Int32, 4] # 每个 stage 共 16 字节，用于存储 try_cancel 的响应
+```
+
+接下来我们跳到由 scheduler warp 执行的代码块：
+
+```python
+if warp_idx == self.sched_warp_id and is_first_cta_in_cluster:
+
+    clc_producer_state = pipeline.make_pipeline_state(
+        pipeline.PipelineUserType.ProducerConsumer, self.num_clc_stage
+    )
+
+    while work_tile.is_valid_tile:
+        clc_pipeline.producer_acquire(clc_producer_state)
+        mbarrier_addr = clc_pipeline.producer_get_barrier(clc_producer_state)
+        tile_sched.advance_to_next_work(mbarrier_addr) # 发出 try_cancel
+        clc_producer_state.advance()
+
+        # scheduler 在下方同时充当 consumer
+        clc_pipeline.consumer_wait(clc_consumer_state)
+        work_tile = tile_sched.get_current_work() # 发出 query_cancel
+        clc_pipeline.consumer_release(clc_consumer_state)
+        clc_consumer_state.advance()
+    clc_pipeline.producer_tail(clc_producer_state)
+```
+
+* 如前所述，我们在第 1 行看到，只有每个 cluster 的第一个 CTA 才会执行这个代码块。
+* 在第 3-5 行中，pipeline state 用 `PipelineUserType.ProducerConsumer` 定义，因此它以翻转（flipped）的相位比特（phase bit）开始，这样 scheduler 一开始就不会在 `producer_acquire` 处等待，可以立即开始获取 work tile。这与 `PipelineUserType.Producer` 的行为一致。
+
+我们再更细致地看看工具文件 [sm100.py](https://github.com/NVIDIA/cutlass/blob/ae6bccf341fb4410241f696ba06873023d5ce4ed/python/CuTeDSL/cutlass/pipeline/sm100.py#L702) 中 `PipelineClcFetchAsync` 的 `producer_acquire` 方法：
+
+```python
+class PipelineClcFetchAsync:
+     ...
+     def producer_acquire(...):
+         """
+         Producer acquire 等待 empty buffer 并在 full barrier 上设置事务期望值。
+        :param state: 指向当前 buffer stage 的 pipeline state
+        :param try_acquire_token: 可选 token，用于跳过对 empty barrier 的等待
+        """
+        if_generate(
+            try_acquire_token is None or try_acquire_token == 0,
+            lambda: self.sync_object_empty.wait(...)
+        if_generate(
+            self.is_signalling_thread,
+            lambda: self.sync_object_full.arrive(
+                state.index, self.producer_mask, loc=loc, ip=ip
+            ),...)
+```
+
+`is_signalling_thread` 和 `producer_mask` 是什么？答案可以在该类前面的代码中找到：
+
+```python
+class PipelineClcFetchAsync: …
+
+    def _init_full_barrier_arrive_signal(cta_layout_vmnk: cute.Layout, tidx: Int32):
+        """
+        计算 producer barrier 的信号参数：根据线程 ID 返回目标 CTA 的 rank
+        （0 到 cluster_size-1），以及一个布尔标志，指示该线程是否参与信号发送。
+        """
+        dst_rank = tidx % 32
+        is_signalling_thread = dst_rank < cute.size(cta_layout_vmnk)
+        return dst_rank, is_signalling_thread
+    def create(...)
+        consumer_mask = 0
+        …
+        (producer_mask, is_signalling_thread) = (
+            PipelineClcFetchAsync._init_full_barrier_arrive_signal(
+                cta_layout_vmnk, tidx
+            )
+        )
+```
+
+我们在第 9-10 行看到，scheduler warp 中前 cluster-size 个线程各自负责向 cluster 中不同的 CTA 发送信号（线程 `i` 向 cluster 中的 CTA `i` 发送信号）。另外注意，第 13 行的 `consumer_mask = 0` 使得所有 consumer 在 release 时都向 cluster 中的第一个 CTA 发送信号。
+
+接下来，在 scheduler warp 中真正触发 `try_cancel` 的方法，是其代码块第 10 行的 `tile_sched.advance_to_next_work(mbarrier_addr)`；它会由选出的单个线程调用 `issue_clc_query`，最终归结为一个对应 PTX 指令 `clusterlaunchcontrol.try_cancel` 的操作。
+
+我们接着看 scheduler warp 代码中的 consumer 部分——它同样会被所有其他 consumer warp（即 TMA、MMA 和 epilogue warp）执行。
+
+```python
+clc_pipeline.consumer_wait(clc_consumer_state)
+work_tile = tile_sched.get_current_work() # 发出 query_cancel
+clc_pipeline.consumer_release(clc_consumer_state)
+clc_consumer_state.advance()
+```
+
+为了获取下一个 work tile 的信息，每个 consumer 都会调用 `get_current_work`，它本质上是 [work_tile_info_from_clc_response](https://github.com/NVIDIA/cutlass/blob/f74fea9ce35868d3ae9f8d1dce1969d7250d3f90/python/CuTeDSL/cutlass/utils/dynamic_persistent_tile_scheduler.py#L240) 的一层封装（两者都位于库文件 [dynamic_persistent_tile_scheduler.py](https://github.com/NVIDIA/cutlass/blob/f74fea9ce35868d3ae9f8d1dce1969d7250d3f90/python/CuTeDSL/cutlass/utils/dynamic_persistent_tile_scheduler.py) 中）。这里发生了一些有意思的逻辑，我们更仔细地看一下：
+
+```python
+def work_tile_info_from_clc_response(
+    self, result_addr: cute.Pointer, *, loc=None, ip=None
+) -> WorkTileInfo:
+    """
+    在 Python 中模拟解析 CLC 响应数据。
+    result_addr: 16 字节的响应数据（模拟共享内存访问）
+    """
+    m_idx, n_idx, l_idx, vld = cute.arch.clc_response(result_addr, loc=loc, ip=ip)
+    cute.arch.fence_proxy(
+        "async.shared",
+        space="cta",
+    )
+    cta_idx_in_cluster, cta_idy_in_cluster, _ = self.cta_id_in_cluster
+    cur_tile_coord = (m_idx + cta_idx_in_cluster, n_idx + cta_idy_in_cluster, l_idx)
+    return WorkTileInfo(cur_tile_coord, vld)
+```
+
+第 8 行是解码响应数据的地方（`clc_response` 归结为对应 PTX 指令 `clusterlaunchcontrol.query_cancel` 的操作）。由于从 `query_cancel` 获得的 CTA 坐标（在*网格中*的坐标）总是 cluster 中的第一个，我们需要用本 CTA 在*其 cluster 中*的坐标做偏移，才能正确得到它的 tile 坐标。
+
+但我们要着重指出第 9-12 行使用了一个 shared 的 async proxy fence，这看起来不太寻常——在标准的 GEMM kernel 中（例如[这里](https://github.com/NVIDIA/cutlass/blob/cb37157db50d0528c4aea99feb37946ec278e3d9/examples/python/CuTeDSL/cute/blackwell/kernel/dense_gemm/dense_gemm.py#L1032)），这类 fence 只在 TMA store 之前出现，用来确保一次 generic-proxy 的 r2s（register-to-shared）写入已经完成，然后 async-proxy 的 TMA store 才去读取这些数据。而在这里，唯一相关的 async-proxy 操作是 `try_cancel` 把响应数据写入 SMEM，且这个 fence 是在响应数据被解码*之后*才调用的，因此这个 fence 实际上是在防止下一次迭代的 `try_cancel` 在当前迭代还没读完那块 SMEM 之前就把它覆盖掉。另外注意，在 `clc_response` 调用之前并没有 proxy fence——尽管 PTX 文档中没有明确提到，但很可能就像 TMA load 一样，在 `try_cancel` 的响应数据传输完成之后会隐式地执行一次 proxy fence。
+
+### 多 stage 的 CLC pipeline
+
+尽管本示例并不支持，但我们可以通过给 CLC pipeline 设置多个 stage，来允许排队缓存多于一个的 work tile（例如，[CUTLASS C++ kernel](https://github.com/NVIDIA/cutlass/blob/main/include/cutlass/gemm/kernel/sm100_gemm_tma_warpspecialized.hpp) 就是这么做的，深度为 3）。在某些情况下这可能有用，可以在某些 work tile 完成得极快时隐藏调度延迟（例如，在变长 attention 中，某些 work tile 甚至可能是空的）。
+
+然而，让 CLC pipeline 过深会带来另一种担忧——我们可能会因为给不同 SM 排队了不等量的工作负载，而得到更差的动态负载均衡。事实上，stage 数量越大，CLC 就越像静态持久化调度。此外，对于波次（wave）很少且工作负载不均衡的问题，可能出现这样的情况：即使只有一个 stage，我们仍然希望阻止 scheduler warp 在 MMA mainloop 结束之前就去执行 `try_cancel`。例如，在本文前面描述的 grouped GEMM 例子中，如果让 scheduler 立即发出第一次 `try_cancel`，那么被分配了大 K 值 tile 的 cluster 可能会立即又领到另一个大 K 值的 tile，于是我们可能最终得到一个高度不均衡的工作负载分布，就跟静态持久化调度器一样。
+
+### CLC 与并发 kernel 及抢占
+
+根据编程指南，除了 kernel 已经没有尚未启动的 cluster 之外，`try_cancel` 失败的另一个原因，可能是在第一个 kernel 已经开始执行之后，又启动了第二个优先级更高的 kernel。在观察到 `try_cancel` 失败之后，第一个 kernel 的各 CTA 会退出，把 GPU 资源让给第二个 kernel 运行。然后，在优先级更高的 kernel 结束之后，如果第一个 kernel 尚未执行完它的整个网格，就会启动新的 cluster 来完成第一个 kernel 网格中剩下的部分。允许这种“抢占（pre-emption）”（这个术语来自 [CUDA 编程指南](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/cluster-launch-control.html)）是 CLC 比静态持久化调度器更灵活的又一个体现——静态持久化调度器无法在 kernel 启动之后动态地重新分配资源。
+
+### CLC 与静态持久化、单 tile 调度器的对比 —— 均衡工作负载
+
+虽然 CLC 被宣传为在工作负载不均衡的情形下相比静态持久化调度器更有优势，但即便是在标准的 GEMM kernel 上，把 CLC 的性能与静态持久化和单 tile 调度做基准对比似乎也是值得的。
+
+本节的实验在一台 B200 上完成，它有 148 个 SM，可配置成 74 个大小为 2 的 cluster。对于 CLC，我们使用了 NVIDIA 的 CuTeDSL 示例 [dense_gemm_persistent_dynamic.py](https://github.com/NVIDIA/cutlass/blob/ae6bccf341fb4410241f696ba06873023d5ce4ed/examples/python/CuTeDSL/cute/blackwell/kernel/dense_gemm/dense_gemm_persistent_dynamic.py)。对于静态持久化，我们使用了 [dense_gemm_persistent.py](https://github.com/NVIDIA/cutlass/blob/ae6bccf341fb4410241f696ba06873023d5ce4ed/examples/python/CuTeDSL/cute/blackwell/kernel/dense_gemm/dense_gemm_persistent.py)，它的代码除了调度器和 work tile 信息计算之外，与 `dense_gemm_persistent_dynamic.py` 大体相同。对于单 tile 逻辑，我们修改了 `dense_gemm_persistent_dynamic.py`，移除了其中的持久化调度逻辑（最接近的、开箱即用地实现单 tile 调度的示例文件似乎是 [dense_gemm.py](https://github.com/NVIDIA/cutlass/blob/ae6bccf341fb4410241f696ba06873023d5ce4ed/examples/python/CuTeDSL/cute/blackwell/kernel/dense_gemm/dense_gemm.py)，但它与其他 kernel 不太可比——例如它不使用 warp 专用化（warp-specialization），而其他 kernel 都用了）。我们使用了 batch size 为 1，以及如下配置：
+
+```
+ab_dtype: Float8E4M3FN, c_dtype: Float32, acc_dtype: Float32
+a_major: k, b_major: k, c_major: n
+mma_tiler_mn: (256, 256), cluster_shape_mn: (2, 1)
+use_2cta_instrs: True, use_tma_store: True
+Warmup iterations: 500
+Iterations: 100
+Skip reference checking: True
+Use cold L2: True
+```
+
+我们对满足 M = N 的问题形状 (M, N, K) 做了基准测试：M、N 取从 1024 到 32768 的 2 的幂，以及这些值的 1.5 倍，K 取 [2048, 8192]。我们的结果如下图所示：
+
+![CLC、静态持久化、单 tile 调度在均衡 GEMM 上的性能对比，K = 2048](images/fig07_balanced_perf_1.png)
+
+![CLC、静态持久化、单 tile 调度在均衡 GEMM 上的性能对比，K = 8192](images/fig08_balanced_perf_2.png)
+
+持久化调度器优于单 tile 调度的表现并不意外，因为它们能够把 epilogue 与 MMA mainloop 重叠。当 K 较小时，epilogue 在每个 work tile 运行时间中所占的比例相对更大；而当 K 较大时，epilogue 所占的运行时间比例要小得多，因此单 tile 调度在没有 epilogue 重叠的情况下，相对损失的效率反而更少。对于较小的问题形状，各调度器之间几乎没有差别，因为此时还不到一整波（wave）的 cluster。
+
+然而，观察到的 CLC 与静态持久化之间的性能差异则显得更加扑朔迷离，尽管总体上 CLC 在较大的工作负载下似乎表现更差。为了更深入地理解，我们可以对比它们各自的 tensor pipe 吞吐图，这些图由 Nsight Compute 的 PM 采样得到。回顾一下，这类图给出的是吞吐随时间的时间线视图，其中 x 轴是经过的时间，y 轴是利用率百分比。对于问题形状 (16384, 16384, 2048)，CLC 的情况如下：
+
+![CLC 的 tensor pipe 吞吐时间线，问题形状 (16384, 16384, 2048)](images/fig09_clc_tensorpipe_16384.png)
+
+而静态持久化的情况如下：
+
+![静态持久化的 tensor pipe 吞吐时间线，问题形状 (16384, 16384, 2048)，可见逐渐下降的趋势](images/fig10_static_tensorpipe_16384.png)
+
+第二张图中看到的 tensor pipe 使用率逐渐下降，说明有些 SM 比其他 SM 更早完成，并在 kernel 末尾变得空闲，因此与静态持久化相比，CLC 能够更好地利用整块 GPU。
+
+另一方面，对于 (32768, 32768, 2048)，CLC 的 tensor pipe 吞吐看起来是这样的：
+
+![CLC 的 tensor pipe 吞吐时间线，问题形状 (32768, 32768, 2048)，利用率持续偏低](images/fig11_clc_tensorpipe_32768.png)
+
+而静态持久化的情况如下：
+
+![静态持久化的 tensor pipe 吞吐时间线，问题形状 (32768, 32768, 2048)](images/fig12_static_tensorpipe_32768.png)
+
+所以在这种情况下，不知为何，静态调度器的下降反而没那么严重，而 CLC 的 tensor pipe 吞吐则看起来持续偏低。有一个指标与这一观察（针对 (32768, 32768, 2048)）相关联：NCU 报告 CLC 的 L2 命中率仅为 35%，而静态持久化为 52%。造成这一差异的原因尚不清楚。注意，两个 kernel 都没有做 work tile swizzling，而对于问题形状 (16384, 16384, 2048)，NCU 显示两个 kernel 的 L2 命中率都在约 60%。
+
+上述实验表明，即使对于均衡的工作负载，出于调优目的也应当同时保留静态调度和 CLC 两种方案。我们还要指出，这些示例 kernel 并不包含 work tile swizzling、blockscaling 或非平凡的 epilogue 等特性，而这些特性可能会改变对比分析的结论。
+
+鉴于 CLC 的 tensor pipe 吞吐没有在 kernel 尾部随时间逐渐下降，我们还统计了每个 SM 所计算的 tile 数量。使用静态持久化调度器时，各 SM 计算的 tile 数量至多相差 1；但我们观察到，使用 CLC 时并非如此。例如，对于问题形状 (M, N, K) 为 (16384, 16384, 2048) 的情况，各 SM 处理了 54 到 59 个 tile，其频次（因为我们做的是 2CTA MMA，所以以 SM 对为单位）如下面的直方图所示：
+
+![使用 CLC 时每个 SM 对所计算的 tile 数量直方图，问题形状 (16384, 16384, 2048)](images/fig13_tiles_histogram_16384.png)
+
+对于问题形状 (32768, 32768, 2048)，所计算 tile 数量的直方图则如下所示：
+
+![使用 CLC 时每个 SM 对所计算的 tile 数量直方图，问题形状 (32768, 32768, 2048)](images/fig14_tiles_histogram_32768.png)
+
+上面的直方图表明，出于某些原因（也许是硬件层面的，也许是其他原因），某些 SM 最终可能比其他 SM 多计算多达 5% 的 tile。因此，强制所有 SM 计算（几乎）完全相同数量的 tile，即便是均衡的，也可能略微欠优。
+
+关于 attention（而非 GEMM）场景下的另一个工作分布直方图示例，我们请读者参阅这个[给 FlashAttention-4 添加 CLC 的 PR](https://github.com/Dao-AILab/flash-attention/pull/2218)。
+
+### 结论
+
+在本文中，我们探讨了 CLC——Blackwell GPU 上引入的、由硬件支持的动态持久化调度实现。CLC 兼具单 tile 调度和静态持久化调度这两种更传统范式的优点。我们考察了 CLC 所需的底层 PTX 指令 `try_cancel` 和 `query_cancel`，然后以示例 `dense_gemm_persistent_dynamic.py` 为例，逐行讲解了一个 CuTeDSL 实现——其中每个 cluster 用单个 scheduler warp 去尝试窃取 work tile，并用一个 CLC pipeline 将结果传达给其他 warp。对于不均衡的工作负载，CLC 明显比静态持久化更高效；但我们也探讨了：即便对于均衡的工作负载，CLC 与静态持久化调度之间仍然存在细微差别，二者似乎都算不上明显的赢家。
