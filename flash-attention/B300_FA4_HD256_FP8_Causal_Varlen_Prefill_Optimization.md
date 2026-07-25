@@ -1,1492 +1,1723 @@
-# B300 FA4 HD256 FP8 Causal Varlen Prefill 优化复盘
+# B300 FA4 HD256 FP8 Causal Varlen Prefill Kernel 优化
 
-> 最后整理：2026-07-25
 > 代码基线：Atrex `0381108a`
-> 目标场景：NVIDIA B300 / SM103、FP8 E4M3 Q/K/V、BF16 输出、`head_dim=256`、causal varlen prefill、GQA16、contiguous/paged KV
+> 目标：NVIDIA HGX B300 / SM103、FP8 E4M3 Q/K/V、BF16 O、`head_dim=256`、causal varlen prefill、GQA16
 
-## 1. 文档目的与阅读方式
+## 1. 本文只讨论 GPU kernel
 
-本文不是按 commit 顺序记录实验，而是按“大的优化方向 → 可复用的小 trick”整理。每个 trick 都回答五个问题：
+本文只记录算子内部优化：
 
-1. 它解决什么瓶颈；
-2. 具体如何实现；
-3. 最关键的工程技巧或 invariant 是什么；
-4. 有什么收益和证据；
-5. 它目前属于产品主路径、历史经验，还是已回退实验。
+- B300/SM103 使用了哪些硬件能力；
+- Q/K/V/O 如何在 GMEM、SMEM、TMEM、register 之间搬运；
+- `tcgen05.mma`、TMA、TMEM load/store、barrier 对应哪些 PTX/SASS；
+- QK、softmax、P cast、PV、online-softmax correction、epilogue 如何编排；
+- 哪些工作异步 overlap，哪些依赖必须显式同步；
+- 每个 tile 搬多少数据、做多少计算；
+- 2CTA、CLC、PackGQA、K ping-pong、Paged-KV TMA 为什么有效。
 
-正文分成五个大的优化方向：
+本文不覆盖 host/API 工程。
 
-```text
-一、缩小问题与做真 varlen
-    ├─ 专用 kernel / 依赖收敛
-    ├─ native varlen，删除 dense 绕路
-    └─ ragged O TMA-store（原型线经验）
-
-二、调度与工作几何
-    ├─ CLC + LPT
-    ├─ 2CTA logical cluster geometry
-    ├─ PackGQA 与 wave cliff
-    └─ 固定 2CTA + CLC 产品 topology
-
-三、计算流水线与片上资源
-    ├─ K-direction ping-pong
-    ├─ CLC 跨 work-tile phase
-    ├─ KV pipeline stage
-    ├─ sQ/sO 生命周期复用
-    ├─ warp-role 寄存器重分配
-    └─ split-P arrival
-
-四、Paged-KV 数据搬运与寻址
-    ├─ TMA / multicast / LDGSTS / vector copy 的选择
-    ├─ 一页多 tile 的 TMA
-    ├─ 一 tile 多页的 small-page TMA
-    ├─ K/V page ID 缓存
-    └─ masked tail 的安全物理页
-
-五、FP8 数值与服务热路径
-    ├─ P scaling / correction 联合设计
-    ├─ prepared launcher
-    ├─ CUDA Graph-safe runtime metadata
-    └─ 编译、部署和性能测量收敛
-```
-
-提交时间线只放在附录中，用于查找代码，不作为正文结构。
-
-## 2. 当前产品路径：先明确“现在运行的是什么”
-
-截至 Atrex `0381108a`，目标路径为：
-
-| 维度 | 当前配置 |
-| --- | --- |
-| GPU | B300 / SM103 |
-| 输入 | 主要验证为 FP8 E4M3 Q/K/V；接口也已支持部分 mixed-dtype vLLM 路径 |
-| 输出 | BF16 |
-| Attention | causal varlen forward |
-| Head | `head_dim=head_dim_v=256` |
-| GQA | ratio=16；典型为 HQ16/HKV1、HQ32/HKV2 |
-| CTA | physical cluster `(2, 1, 1)` |
-| Scheduler | CLC + varlen mapping + causal LPT |
-| Pipeline | `q_stage=1`、K ping-pong、KV TMA stage=5 |
-| Paged KV | page16/32/64/128/256 |
-| GQA organization | 默认 PackGQA |
-| Split KV | `num_splits=1` |
-| Host path | `prepare()` 固化静态属性，`run()` 只传动态 tensor |
-
-当前路径有几个容易误解的事实：
-
-- 2CTA 不是两个独立的 HD128 attention。两个 CTA 共同执行完整 HD256 的 `UTCQMMA.2CTA`；CTA pair 合作完成 QK/PV，输出行仍由各 CTA 本地负责。
-- CLC 的 worker 是整个 physical cluster，不是单个 CTA。两个 CTA 必须消费同一个 dynamic work。
-- `q_stage=1` 不等于没有 ping-pong。Q/O 只保留一个 stage，但 S/P 可以沿 K-block 方向使用两个 slot。
-- 当前 varlen 产品路径并没有使用 ragged TMA O-store。ragged O TMA 是原型分支上验证有效的技术；当前 2CTA + PackGQA 路径仍由 correction/epilogue warp 完成 O store。
-- page-table 的单位是 page，kernel 调度的单位是 logical KV tile；二者不能混用。
-
-### 2.1 三层状态必须分开
-
-这条 kernel 最容易出错的地方，不是某条 MMA 指令，而是混淆不同层次的状态：
+当前 kernel 的核心配置为：
 
 ```text
-Host 静态状态
-    dtype / head / page_size / PackGQA / kernel topology
-    → 必须进入 prepare 或 compile key
-
-Scheduler work 状态
-    batch / head / logical Q cluster tile / causal K range
-    → CLC 以 cluster 为单位动态发放
-
-Pipeline epoch 状态
-    KPP slot / barrier phase / producer-consumer generation
-    → persistent CLC 下可能跨 work-tile 存活
+physical cluster       (2, 1, 1)
+threads / CTA          320 = 10 warps
+logical QK tile        M256 × N128 × K256（CTA pair）
+per-CTA Q rows         128
+Q stage                1
+S/P K-direction slots  2
+K/V TMA stages         5
+input                   FP8 E4M3
+accumulator             FP32 in TMEM
+output                  BF16
+scheduler               CLC + causal LPT
+GQA                     PackGQA, ratio 16
 ```
 
-优化时如果把本层状态错误地当成局部循环变量，通常会表现为：partial cluster 算错、odd K-block 后 hang、CUDA 912、随机精度错误或 JIT cache 复用错误 CUBIN。
+## 2. B300 硬件预算与算子瓶颈
 
-### 2.2 Paged-KV 的三个单位必须分开
+### 2.1 官方硬件数据
+
+NVIDIA Blackwell Ultra Datasheet 对 HGX B300 的公开规格为：
+
+| 单 GPU 指标 | HGX B300 Blackwell Ultra |
+| --- | ---: |
+| FP8/FP6 Tensor Core | 9 PFLOPS sparse，即 4.5 PFLOPS dense |
+| HBM3E | 270 GB |
+| HBM bandwidth | 7.7 TB/s |
+| HGX B300 GPU 数 | 8 |
+| HGX B300 总 FP8/FP6 | 72 PFLOPS sparse |
+
+因此 dense FP8 的理论 ridge point 约为：
 
 ```text
-n_block        kernel 的 logical KV tile 编号
-logical page   page_table 的列编号
-physical page  page_table 中记录的实际页号
+4.5 PFLOP/s ÷ 7.7 TB/s ≈ 584 FLOP/byte
 ```
 
-FP8 路径 `tile_n=128`：
+这个数字只适合判断“最终是否可能受 HBM 限制”。本 kernel 的 K/V 会跨 Q tiles 在 L2 中复用，所以实际 HBM arithmetic intensity 高于单 cluster 的 SMEM staging intensity；测量中 DRAM SOL 往往很低，主要瓶颈更常是 tensor-pipe 利用率、TMA/地址 latency 和 barrier。
 
-| page size | tile/page 关系 |
-| ---: | --- |
-| 16 | 一个 tile 聚合 8 页 |
-| 32 | 一个 tile 聚合 4 页 |
-| 64 | 一个 tile 聚合 2 页 |
-| 128 | 一页正好一个 tile |
-| 256 | 一页包含两个 tile |
+来源：
 
-后续所有 Paged-KV 优化都建立在这个分层上。
+- [NVIDIA Blackwell Ultra Datasheet](https://resources.nvidia.com/en-us-blackwell-architecture/blackwell-ultra-datasheet)
+- [NVIDIA HGX B300 specifications](https://www.nvidia.com/en-us/data-center/hgx.md)
 
-## 3. 优化总览
+### 2.2 SM 片上资源为什么决定当前 tile
 
-| 大优化方向 | 小 trick | 主要收益 | 当前状态 |
-| --- | --- | --- | --- |
-| 做真 varlen | native varlen，删除 route-to-dense | 统一 ABI 和维护路径 | 当前原则 |
-| 做真 varlen | ragged O TMA-store | multi-sequence 代表 case `-12%` | 原型线有效，当前产品未使用 |
-| 做真 varlen | 最小化 vendored kernel | 可安装、可复现、减少无关 specialization | 当前产品基础 |
-| 调度与几何 | CLC + LPT | 降低 causal/varlen long tail | 当前主路径 |
-| 调度与几何 | 修正 2CTA logical tile | 修复 CTA1 causal K 范围 | 当前正确性基础 |
-| 调度与几何 | physical cluster-aware CLC | 修复 partial cluster / prefix-cache | 当前正确性基础 |
-| 调度与几何 | PackGQA | 降低 padding、KV 重读和 wave cliff | 当前主路径 |
-| 流水线 | K ping-pong | overlap `QK(i+1)` 与 `softmax/PV(i)` | 当前主路径 |
-| 流水线 | 跨 work phase + dummy handshake | CLC 下恢复 KPP 且保持正确 | 当前主路径 |
-| 流水线 | KV stage 4→5 | 代表 case `0.8%–2.4%` | 当前主路径 |
-| 流水线 | sQ/sO alias | 1CTA 代表 case `1%–5.2%` | 历史有效，当前 2CTA 禁用 |
-| Paged-KV | 按规则性选择 TMA/LDGSTS/vector copy | 降低地址指令并控制同步成本 | 当前设计方法 |
-| Paged-KV | page128/256 TMA | LSU 指令约降 13 倍 | 当前主路径 |
-| Paged-KV | page16/32/64 TMA | FP8 60/60 快于当时 TRT baseline | 当前主路径 |
-| Paged-KV | page ID register cache | global loads 约降 32.8% | 当前主路径 |
-| Paged-KV | safe tail page | 避免 masked load 读取 FP8 NaN | side branch，尚未进入 HEAD |
-| FP8 数值 | `max_offset=4, threshold=4` | 平衡 underflow、saturation 和 correction | 当前配置 |
-| Host | prepared launcher + graph-safe metadata | dispatch/validation 移出热路径 | 当前主路径 |
-
-## 4. 大优化点一：缩小问题，并把 varlen 做成真正的主路径
-
-这一组优化的核心不是某个微小 knob，而是先让产品语义、kernel specialization 和部署边界一致。否则局部 benchmark 再快，也会被双路径维护、错误 import 或 host sync 抵消。
-
-### 4.1 小 trick：用专用 kernel 缩小支持面
-
-#### 解决的问题
-
-早期实现从 generic FA4 interface 继承了大量不相关组合：SM80/90/100/120、forward/backward、不同 head dim、MLA、SplitKV、1CTA/2CTA 等。对目标 workload 而言，这些分支会带来：
-
-- 更大的依赖和源码面；
-- 更多 JIT specialization 与 compile cache 维度；
-- 更难证明测试命中了目标 kernel；
-- 修改一个公共 helper 时引入无关回归。
-
-#### 怎么做
-
-提交 `80774d20` 建立最小化、自包含的 HD256 forward 路径：
-
-- Atrex 只 vendor 上游当时没有的 HD256 专用 kernel；
-- 通用 softmax、mask、PagedKV、scheduler helper 从已安装的 FA4 wheel 导入；
-- interface 删除 backward、autograd、SM80/90/120、MLA 等无关 dispatch；
-- 后续再收敛为 SM103、HD256、causal varlen、GQA16、2CTA、CLC-only。
-
-#### 关键技巧
-
-- specialization 的价值不仅是少几个 `if`，更重要的是可以围绕真实 workload 固化 invariant，并在构造阶段直接 assert。
-- 不支持的输入应尽早失败，不能静默 fallback 到另一个未调优 kernel。
-- kernel identity、threads/block、cluster shape 必须成为性能报告的一部分；只看 API 名无法证明走了专用路径。
-
-#### 当前状态
-
-这是当前产品路径的基础。当前构造函数明确约束 SM103、2CTA、varlen Q 和 CLC。
-
-### 4.2 小 trick：先用 route-to-dense 找 ceiling，再删除它
-
-#### 解决的问题
-
-原型早期 single-sequence varlen 明显慢于 dense，主要原因是：
-
-- varlen O 使用手工 register-to-global epilogue；
-- varlen scheduler 有额外映射和寄存器压力。
-
-提交 `dbb8fe45` 曾利用 `cu_seqlens_q.numel()==2` 判断 batch=1，并临时转到 dense kernel。它不读取 device sequence length，因此适合快速确认 dense 性能上限。
-
-#### 怎么做
-
-这个 trick 的正确用法是两阶段：
+NVIDIA Blackwell Tuning Guide 对 compute capability 10.0 给出的主要资源为：
 
 ```text
-阶段 1：route-to-dense
-    → 估计 epilogue/scheduler 可达到的性能 ceiling
-
-阶段 2：修复 native varlen
-    → 获得相同能力后删除 dense 路由
+register file             64K × 32-bit registers / SM
+max registers / thread    255
+shared memory / SM        228 KB
+max shared memory / CTA   227 KB
+max concurrent warps      64 / SM
 ```
 
-提交 `6911ed40` 最终删除 dense entry 和 route-to-dense，让 ABI 与执行语义统一为 native varlen。
-
-#### 关键技巧
-
-- fast path 可以用于定位上限，但不能代替修主路径。
-- 不要为了 dispatch 把 `cu_seqlens` 拷回 host；同步成本通常比 kernel 差异更大，并破坏 CUDA Graph。
-- batch=1 仍然是 varlen ABI，未来可能带 `seqused_q/k`、paged KV 或其他 runtime metadata。
-
-#### 当前状态
-
-route-to-dense 已删除。当前产品坚持 varlen-only，并把动态长度留在 device side。
-
-### 4.3 小 trick：ragged O TMA-store
-
-#### 解决的问题
-
-packed varlen 输出为：
+当前 FP8 kernel 每 CTA 使用约 `182.27 KB` dynamic shared memory，因此一个 SM 只能驻留一个 CTA。当前测试设备由 CUDA/NCU 报告 148 SM；2CTA cluster 需要两个 SM，所以同一时刻最多约：
 
 ```text
-O: [total_q, num_heads, head_dim]
-
-seq0 → rows [0, q0)
-seq1 → rows [q0, q0+q1)
-seq2 → rows [q0+q1, q0+q1+q2)
+148 CTA / 2 CTA per cluster = 74 resident clusters
 ```
 
-每条 sequence 的起点由 `cu_seqlens_q` 决定，可能不按 8/16/128 对齐。普通 dense TMA descriptor 无法直接表示任意 runtime ragged base，早期只能使用手工 `STG` epilogue，产生更多指令、寄存器压力和 spill。
+这也是 PackGQA、work count 和 wave cliff 特别重要的根本原因。
 
-#### 怎么做
+来源：[NVIDIA Blackwell Tuning Guide — Occupancy](https://docs.nvidia.com/cuda/blackwell-tuning-guide/index.html#occupancy)
 
-原型提交 `487d3f3e` 从 SM90 路径移植 ragged tensor 机制：
+### 2.3 单个 logical K block 的计算量与片上搬运
+
+CTA pair 每次处理：
 
 ```text
-create_ragged_tensor_for_tma(ragged_dim=0, ptr_shift=True)
-    ↓
-按 sequence 在 runtime 平移 descriptor base pointer
-    ↓
-sequence 内部仍然是规则 tile，可以使用 TMA store
+M = 256 packed Q rows
+N = 128 KV tokens
+D = 256
 ```
 
-它不是让 TMA 支持不规则 stride，而是把不规则性转换成“每条 sequence 一个动态 base”。
-
-#### 关键技巧
-
-- 测试必须包含非对齐 segment start，例如 `[100, 127, 300, 4097]`；只测整齐 4K 分段无法发现地址错误。
-- O、LSE 和 aux tensor 的 ragged offset 要分别确认，不能因为 O 正确就默认全部正确。
-- TMA epilogue 会改变 shared-memory 生命周期、warp role 和寄存器分配，不能只切一个 boolean。
-- SASS 中应看到 `UTMASTG` 替代 `STG.E`，并确认 local load/store 没有重新出现。
-
-#### 收益与状态
-
-原型线上，4×4096 代表 case 从 `303.97 us` 降到 `267.36 us`，约改善 12%；`STG.E` 从 32 个降为 0，出现 4 个 `UTMASTG`，并消除 local spill。
-
-这是有价值的通用 varlen 技术，但不是当前 2CTA 产品配置。当前代码在 `is_varlen_q=True` 时 `use_tma_O=False`，PackGQA/varlen 输出仍由 correction/epilogue warp 写回。未来若重新引入，必须针对 2CTA + PackGQA 单独证明 layout 和生命周期。
-
-### 4.4 小 trick：把源码、依赖和 wheel 行为收敛成同一个实现
-
-#### 解决的问题
-
-原型曾依赖本地 `/home/mudi/flash-attention`、`sys.path` 注入、`inspect.getsource`、字符串替换和 `exec`。它适合快速实验，但会导致：
-
-- 本地未提交代码静默影响 Atrex；
-- wheel 不包含实际执行源码；
-- traceback、source mapping 和 cache key 难以追踪；
-- 换机器或 clean environment 后无法复现。
-
-#### 怎么做
-
-- `06a506be`：固定 FA4 来源，把修改保存为 tracked patch，build 时幂等应用。
-- `80774d20`：只 vendor 目标专用 kernel，其余依赖来自 wheel。
-- `be1c2f0c`：对齐 CUTLASS DSL 4.5.1，并删除不再维护的 1CTA 产品分支。
-- wheel 复现从 `/tmp` 启动、清空 `PYTHONPATH`，确认 import 来自安装包。
-
-#### 关键技巧
-
-- CUTLASS DSL、Quack、FA4 helper 与 vendored kernel 是一个版本组合，不能只升级其中一个。
-- 版本变化后要清 JIT cache，避免旧 CUBIN 掩盖源码或依赖不兼容。
-- `flash-attn-4` 使用 namespace package；环境里其他 `flash_attn` 根包可能遮蔽 `flash_attn.cute`。
-- clean-wheel 验证要打印真实 `__file__`，不能只检查 import 成功。
-
-## 5. 大优化点二：调度与工作几何
-
-这一组优化决定“有多少工作、按什么顺序运行、一个 dynamic work 由谁消费”。对 B300 上的 2CTA kernel，work geometry 往往比局部少几条指令更重要。
-
-### 5.1 小 trick：LPT 提前重 tile，CLC 动态接管尾部 work
-
-#### 解决的问题
-
-causal attention 的 Q tiles 工作量呈三角形：越靠后的 Q tile 能访问越多 K/V blocks。varlen 又叠加 batch 间长度不均。自然顺序会让轻 tile 先运行、重 tile 留在 grid 尾部，造成大部分 SM 提前空闲。
-
-#### 怎么做
+一个 K block 的 QK 与 PV 总 FLOPs：
 
 ```text
-LPT（Longest Processing Time first）
-    把 causal 重 tile 映射到更早的 work ID
-
-CLC（Cluster Launch Control）
-    resident cluster 完成当前任务后，接管尚未启动的 grid work
+QK = 2 × M × N × D
+PV = 2 × M × N × D
+总计 = 4 × 256 × 128 × 256
+     = 33,554,432 FLOPs
 ```
 
-二者解决不同问题：LPT 改善初始顺序，CLC 动态消除尾波；必须组合使用，不能把它们当成同一个机制。
-
-#### 关键技巧
-
-- CLC response valid 与 varlen work valid 是两层概念；取消到 padding grid ID 后仍要安全映射为 invalid work。
-- CLC 可能改善负载均衡，也可能破坏 K/V L2 locality，不能仅凭“causal”就假设一定快。
-- multi-CTA 下被调度的 worker 是 cluster，而不是 CTA。
-- scheduler 的临时变量可能只让某类 warp spill，需按 warp role 看寄存器和 local load/store。
-
-#### 收益与状态
-
-原型 `45d1161b` 中，8K HQ32/HKV2 由 `514.85 us` 降到 `463.62 us`，接近 dense ceiling `463.01 us`。当前产品固定使用 CLC + LPT。
-
-### 5.2 小 trick：区分 CTA tile 与 logical cluster tile
-
-#### 解决的问题
-
-2CTA kernel 中每个 CTA 拥有 128 个 Q rows，但一个 scheduler work 由 CTA pair 共同处理 256 rows：
+每个 K block 从 GMEM/L2 搬入 cluster SMEM 的 FP8 payload：
 
 ```text
-CTA0: Q rows [0, 128)
-CTA1: Q rows [128, 256)
-logical cluster tile: [0, 256)
+K = 128 × 256 × 1B = 32 KB / cluster
+V = 128 × 256 × 1B = 32 KB / cluster
+合计                    64 KB / cluster
 ```
 
-早期 causal `BlockInfo` 使用单 CTA 的 `cta_tiler[0]` 计算 K 上界，导致 CTA1 后 128 行需要的较晚 K blocks 被错误裁掉。
-
-#### 怎么做
-
-提交 `1a10ace9` 将 causal/local bound 使用的逻辑 M tile 修正为：
+只按 K/V staging 计算：
 
 ```text
-logical_m_tile = cta_tiler[0] * cta_group_size
+33.55 MFLOPs ÷ 64 KB = 512 FLOP/byte
 ```
 
-同时明确以下尺寸各自服务不同语义：
+它接近但低于 584 FLOP/byte 的理论 ridge point，因此 K/V TMA、L2 命中和 pipeline depth 都很重要。与此同时，多 Q tiles 会在 L2 中复用 K/V，实际 HBM 流量可远低于所有 cluster staging 流量；所以最终要用 NCU 区分 HBM、L2/TMA latency 和同步瓶颈。
 
-- `cta_tiler`：单 CTA 的 shared-memory / row ownership；
-- `mma_tiler_qk`：2CTA UMMA 覆盖范围；
-- scheduler tile：一个 dynamic work；
-- cluster tile：causal bounds 和 cluster coordinate 的逻辑范围。
+## 3. 2CTA、warp specialization 与片上存储
 
-#### 关键技巧
+### 3.1 2CTA 不是两个独立的 HD128 attention
 
-- 不要寻找一个“统一 M size”到处复用；causal bounds、grid count、epilogue ownership 本来就可能使用不同 M 尺寸。
-- 必测 `128±1`、`256±1`、1408 等 partial final cluster；整 256 对齐 case 很容易漏 bug。
-- CTA0 正确不代表 CTA1 正确，应按 row range 分别比较。
-
-### 5.3 小 trick：CLC descriptor 必须描述 physical cluster
-
-#### 解决的问题
-
-早期 launch 使用 physical cluster `(2,1,1)`，但 CLC problem descriptor 仍声明 `cluster_shape_m=1`。结果 CTA0/CTA1 可能取得不同 dynamic work，随后却继续通过 2CTA UMMA 和 cluster barrier 合作，导致 partial final Q cluster 错乱或 hang。
-
-#### 怎么做
-
-`45e9bda1` 增加 2CTA 专用 varlen scheduler descriptor：
+physical cluster 为 `(2,1,1)`：
 
 ```text
-CLC problem cluster shape = (params.cluster_shape_m, 1, 1)
+CTA0 owns Q rows [0,   128)
+CTA1 owns Q rows [128, 256)
+
+CTA pair jointly executes one M256 × N128 × K256 tcgen05 MMA
 ```
 
-并要求：
+两个 CTA 合作完成完整 `D=256` reduction。它们不是各算一半 head dimension 后在软件中归约；`tcgen05.mma.cta_group::2` 直接访问 CTA pair 的 TMEM/SMEM operand。
+
+NVIDIA PTX ISA 规定：
+
+- CTA pair 是 cluster rank 只差最低 bit 的两个 CTA；
+- `tcgen05` 的 pair-level 操作会访问两个 CTA 的 Tensor Memory；
+- `tcgen05.mma.cta_group::2` 在当前 CTA 和 peer CTA 的 TMEM 上执行；
+- `tcgen05.mma` 是异步、single-thread-semantics 指令，一条指令即可发起完整 MMA。
+
+来源：
+
+- [PTX ISA — CTA Pair](https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-cta-pair)
+- [PTX ISA — tcgen05.mma](https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-mma-instructions-mma)
+
+### 3.2 当前 10-warp 分工
+
+`q_stage=1 + TMA Q/K/V + varlen vector epilogue` 允许把通用 16-warp 布局压缩到 10 warps：
+
+| Warp | 数量 | 任务 | 寄存器配置 |
+| --- | ---: | --- | ---: |
+| softmax warps | 4 | TMEM→register 读取 S；mask、row max、`exp2`、row sum；FP32→FP8 P；写回 TMEM | 160 |
+| correction/epilogue warps | 4 | online-softmax O rescale；最终 normalize；TMEM→SMEM→GMEM | 128 |
+| MMA warp | 1 | 发射 QK/PV `tcgen05.mma.cta_group::2` | 96 |
+| load/CLC warp | 1 | Q/K/V TMA；leader CTA 上预取下一 CLC work | 96 |
+| 合计 | 10 | 320 threads / CTA | — |
+
+关键技巧：
+
+- `tcgen05.mma` 是 single-thread-semantics，不需要用多个 warps 发射；一个 MMA warp 已足够。
+- softmax 与 correction 是标量/SIMT 重工作，分别分配四个 warps，并提高寄存器预算。
+- correction warps 同时承担 epilogue，删除独立 epilogue warp 和空闲 softmax group。
+- load warp 在 TMA 发射完当前 tile 后，替 leader CTA 预取 CLC response，避免为 CLC 再增加第 11 个 warp。
+
+### 3.3 用 warp-role register redistribution 消除 spill
+
+最终配置不是给 320 个 threads 统一设一个较低上限，而是按 warp role 重新分配 CTA register pool：
+
+```python
+# softmax warpgroup, warps 0..3
+cute.arch.setmaxregister_increase(160)
+
+# correction/epilogue warpgroup, warps 4..7
+cute.arch.setmaxregister_decrease(128)
+
+# MMA warp 8 and load/CLC warp 9
+cute.arch.setmaxregister_decrease(96)
+```
+
+对应 PTX 是：
 
 ```text
-launch cluster shape
-    == CLC problem shape
-    == scheduler coordinate divisor
-    == cta_group_size
+setmaxnreg.inc.sync.aligned.u32 160;
+setmaxnreg.dec.sync.aligned.u32 128;
+setmaxnreg.dec.sync.aligned.u32 96;
 ```
 
-#### 关键技巧
-
-- 两个 CTA 必须共享一次 CLC response，不能各自 request/advance。
-- 加构造期 assert 比依赖调用方约定更可靠；当前代码已有 `cluster_shape_m == cta_group_size` 检查。
-- partial final cluster 是这个问题的最小有效测试，完整 cluster 数不会暴露它。
-
-### 5.4 小 trick：PackGQA 优先优化 work 数和 wave 几何
-
-#### 解决的问题
-
-GQA16 若每个 Q head 独立调度，会重复扫描同一 KV head，并分别向 Q tile 边界取整。B300 有 148 SM，2CTA cluster 每波最多约 74 个：
+在当前 SM103 NCU SASS 中对应：
 
 ```text
-148 SM / 2 SM per cluster = 74 clusters per wave
+USETMAXREG.TRY_ALLOC.CTAPOOL ..., 0xa0   # 160
+USETMAXREG.DEALLOC.CTAPOOL       0x80   # 128
+USETMAXREG.DEALLOC.CTAPOOL       0x60   # 96
 ```
 
-例如 unpacked 为 80 clusters 时，虽然只超过 74 六个 cluster，却必须启动低利用率的第二波。
+因此验证时应区分三层名字：CuTeDSL `setmaxregister_*` → PTX `setmaxnreg.inc/dec` → SM103 SASS `USETMAXREG.*.CTAPOOL`。
 
-#### 怎么做
+这不是“每个 warp 实际一直使用这么多寄存器”，而是修改该 warp 每线程可拥有的最大寄存器数。NVIDIA PTX 规定 register pool 以 CTA 为单位维护；`.dec` 把寄存器归还池，`.inc` 从池中申请，若池中数量不足，`.inc` 会阻塞。立即数必须在 24～256 之间且为 8 的倍数；同一 warpgroup 的所有 warps 必须执行相同的 `setmaxnreg`，否则行为未定义。
 
-PackGQA 把同一 KV head 的多个 Q heads 折入 packed M：
+来源：[PTX ISA — `setmaxnreg`](https://docs.nvidia.com/cuda/parallel-thread-execution/#miscellaneous-instructions-setmaxnreg)
 
-- 减少 scheduler work 数；
-- 减少逐 Q-head 的 tile padding；
-- 在 CTA 内复用 K/V；
-- 让 cluster 数从两波边缘回到一波内。
+#### 小 trick：把寄存器给真正保存大 fragment 的 warps
 
-#### 关键技巧
+softmax 的 register pressure 最大。每 CTA 的 S tile 为 `128×128 FP32`，由 128 个 softmax threads 处理；只算 score fragment 就约为：
 
-- PackGQA 的首要分析指标是 cluster/wave 数，不只是理论 K/V 复用。
-- packed M 会改变 token/head 映射、causal indexing 和 epilogue layout，必须覆盖 HQ16/HKV1、HQ32/HKV2。
-- 优化组合要检查 predicate。早期 KPP 条件包含 `not self.pack_gqa`，导致 PackGQA 虽减少 work，却切回慢 pipeline；最终删除该排除，让 PackGQA 与 KPP 同时启用。
-- 记录 physical CTA、cluster 数和相对 74-cluster 容量的位置，单看 tensor shape 不足以解释性能。
+```text
+128 × 128 / 128 = 128 FP32 values/thread
+                    ≈ 128 32-bit registers/thread
+```
 
-### 5.5 小 trick：产品最终固定 2CTA + CLC，不保留 shape policy
+还需要 row max/sum、mask predicate、地址、scale 和 FP8 packing 临时量，所以最终给 softmax 160，而不是只按 score payload 给 128。
 
-#### 解决的问题
+correction 若一次把整个 `128×256 FP32 O` 搬进 128 个 threads，会需要约 256 values/thread，必然超过当前 128 配额。最终代码不这么做，而是：
 
-1CTA/2CTA 最优选择依赖 batch、total Q、Q/K 比、prefix hit、page size、绝对 head 数以及是否跨 wave。早期从 64K 阈值逐渐发展为复杂 shape policy，但规则很快膨胀并过拟合当前 shape 集。
+```text
+correction_rescale: corr_tile_size = 16 columns
+epilogue normalize: corr_tile_size = 16 columns
 
-#### 怎么做
+TMEM load 16 columns → register multiply/convert → TMEM/SMEM store
+然后复用同一批 registers 处理下一段 16 columns
+```
 
-`be1c2f0c` 后收敛为 SM103 2CTA-only，`68c6014e` 再固定 CLC，删除环境变量和 static fallback。
+也就是说，解决 spill 的核心不是盲目增大上限，而是把 O live range 切成 16-column fragments。correction warps 随后复用同一寄存器配额做 epilogue；两个阶段按时间串行，不同时保留 rescale fragment 和完整 output fragment。
 
-#### 关键技巧
+MMA warp 只负责组装 descriptor、发异步 `tcgen05.mma` 和推进 barrier，矩阵 accumulator 放在 TMEM；load/CLC warp 主要保存 TMA descriptor、pipeline state 和少量 page IDs。因此两者都限制在 96，把释放的 pool 留给 softmax/correction。
 
-- 产品选择的是稳定支持边界和整体矩阵，不等于每个 shape 的理论最优。
-- 若未来重新 dispatch，只能使用 host 已知静态 metadata，不能同步读取 device `cu_seqlens`。
-- 1CTA/2CTA、static/CLC 都会扩大 compile variants 和正确性矩阵；没有明确整体收益时不要长期保留双路径。
-- 环境变量适合实验 branch，不应决定生产 kernel 行为。
+#### 小 trick：编译前先做两层 register budget
 
-#### 已知代价
+第一层检查硬件/CTA pool，不预测编译器：
 
-真实 page64 shapes 中，short-Q/very-long-K 的 sub-wave case 仍受 2CTA barrier 成本影响；19 个生产 shapes 有 6 个略慢于当时 TRTLLM-gen，最差为 `+4.98%`，但全部进入“不慢于 5%”门槛。该残余是固定 topology 的明确 trade-off，而非未知噪声。
+```text
+B300 register file                  = 65,536 × 32-bit registers / SM
+threads / CTA                       = 10 warps × 32 = 320
+NCU launch allocation              = 160 registers/thread
+粗略 CTA launch pool               = 320 × 160 = 51,200 registers
 
-## 6. 大优化点三：计算流水线与片上资源
+role maxima requested
+  = 32 × (4×160 + 4×128 + 1×96 + 1×96)
+  = 43,008 registers / CTA
 
-这一组优化的目标是让 QK、softmax、P cast、PV 和 K/V load 尽量重叠，同时不因 shared memory、寄存器或 barrier 增加新的瓶颈。
+CTA-pool headroom before rounding   = 51,200 - 43,008 = 8,192 registers
+occupancy headroom before rounding  = 65,536 - 51,200 = 14,336 registers
+```
 
-### 6.1 小 trick：把 Q-stage 与 K-direction ping-pong 解耦
+这里必须使用“warp 数量 × 该 role 的 registers/thread”，不能只看 kernel 报告的最大 `160 registers/thread`。当前 occupancy 已被约 182.27 KB SMEM 固定为一 CTA/SM，因此把闲置 register capacity 给 softmax，通常不会再降低 residency。
 
-#### 解决的问题
+第二层按 **同时 live 的 thread-local 数据** 估算 role 下界：
 
-HD256 下 TMEM 资源只适合保留一个 Q tile / O accumulator，即 `q_stage=1`。如果把 `q_stage=1` 错解成“所有中间结果也只有一个 slot”，QK、softmax 和 PV 会完全串行。
+```text
+R_live_est
+  = Σ(同时存活的 fragment elements/thread × 每 element 的 32-bit register 数)
+  + scalar state
+  + address/descriptor state
+  + predicate/index temporaries
+  + compiler scheduling margin
+```
 
-#### 怎么做
+只累计同一时间窗口内的 fragment。已经写回 TMEM/SMEM 的前一段不要重复计算；相反，若为了 overlap 同时保留 `current` 和 `next` 两份地址、page ID 或 fragment，就必须两份都计入。特别检查：
 
-沿 K-block 方向为 S/P 保留两个 slot：
+- FP32/Int32/pointer low/high 通常各占一个或两个 32-bit registers；
+- runtime-indexed local array 可能直接落到 local memory，不能假设会完全 registerize；
+- 循环 unroll 会复制临时量并拉长 live range；
+- helper inline 后，调用点两侧原本不重叠的变量可能同时 live；
+- register-local page-ID cache 应只留在 load warp，不应跨到 softmax/correction role。
+
+这一步只能判定“明显放不下”或给 sweep 起点，不能精确预测 spill。寄存器分配、live-range splitting、指令调度和 allocation granularity 都由编译器决定。
+
+#### 小 trick：用编译结果和动态 counter 双重确认
+
+最终接受条件是：
+
+```text
+compile/launch:
+  registers per thread allocated = 160
+  spill stores / spill loads      = 0 / 0
+
+NCU dynamic:
+  sass__inst_executed_register_spilling           = 0
+  sass__inst_executed_register_spilling_mem_local = 0
+  sass__inst_executed_register_spilling_mem_shared= 0
+  derived__local_spilling_requests                 = 0
+```
+
+同时检查 SASS 中没有由寄存器溢出产生的 `LDL/STL`。普通 local-memory 指令也可能来自显式/编译器放置的 thread-local object，所以以 NCU 的 register-spilling 分类为最终依据。NVIDIA Nsight Compute 对 `derived__local_spilling_requests` 的定义就是“register spilling 对 L1 发出的已执行指令和请求数”。
+
+若出现 spill，按下面顺序处理：
+
+1. 先定位是 softmax、correction/epilogue 还是 load role，而不是全 kernel 一起加寄存器。
+2. 以 8 registers/thread 为步长调整对应 `setmaxnreg`，每次重新检查 CTA pool 预算。
+3. 优先缩短 live range：像当前 O 路径一样按 16 columns load→compute→store，避免保留完整 tile。
+4. 把大 accumulator/中间矩阵留在 TMEM，把跨 warp 数据留在 SMEM；register 只保存当前 fragment。
+5. 对地址和 page IDs，只缓存真正复用且长度编译期固定的 tuple；廉价、低复用值可以重算。
+6. 每次同时复查 wall time 和 `setmaxnreg.inc` 等待；“spill 为零”不代表寄存器配置已最优。
+
+来源：[Nsight Compute Profiling Guide — register spilling metrics](https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html#metrics-hw-model)
+
+### 3.4 Shared memory 账本
+
+每 CTA 的主要 SMEM：
+
+| Buffer | 逻辑尺寸 | 每 CTA bytes | 说明 |
+| --- | --- | ---: | --- |
+| sQ | `128 × 256 × FP8` | 32 KB | `q_stage=1` |
+| sO | `128 × 256 × BF16` | 64 KB | 当前不能与 sQ alias |
+| sK/sV physical storage | `5 × 16 KB` | 80 KB | K/V 共享同一块 physical SMEM，5-stage pipeline |
+| barrier/CLC/scratch | — | 约 6.27 KB | mbarrier、CLC response、scale 等 |
+| 合计 | — | 约 182.27 KB | NCU 实测 dynamic SMEM |
+
+K/V 每 stage 是 `16 KB / CTA`：logical cluster K 或 V tile 为 32 KB，由 CTA pair 各持有一半 operand slice。
+
+sQ 和 sO 不做 alias：在 2CTA CLC persistent 生命周期内，只有在所有相关 warp 和下一 work 都不再访问 Q 后才能安全复用；当前同步协议没有提供这个证明，所以为 sO 保留独立 64 KB。
+
+### 3.5 Tensor Memory 账本
+
+PTX ISA 说明，Blackwell 5th-generation Tensor Core 的 TMEM 每 CTA 为：
+
+```text
+128 lanes × 512 columns × 32 bits
+```
+
+当前 HD256 kernel 使用完整 512 columns：
+
+```text
+S/P slot 0      128 columns
+S/P slot 1      128 columns
+O accumulator   256 columns
+合计            512 columns
+```
+
+这解释了为什么：
+
+- `q_stage` 只能为 1：再保留第二个 O accumulator 会超过 TMEM；
+- 仍然可以做 K-direction ping-pong：S/P 使用两个 128-column slot；
+- O 始终以 FP32 留在 TMEM，直到 correction/epilogue。
+
+来源：[PTX ISA — Tensor Memory](https://docs.nvidia.com/cuda/parallel-thread-execution/#tensor-memory)
+
+## 4. PackGQA、physical cluster 与 wave
+
+### 4.1 先区分三个概念
+
+```text
+work tile
+    scheduler 的一个逻辑任务：一个 packed M256 tile × 一个 KV head
+
+physical cluster
+    执行一个 work tile 的两个 CTA，即 cluster=(2,1,1)
+
+wave
+    GPU 同一时刻能驻留的一批 physical clusters
+```
+
+由于每 SM 只能驻留一个 CTA，B300 一 wave 最多运行 74 个 2CTA clusters。wave 不是一次新的 kernel launch，而是 launch 中的并发批次：超过 74 的 work 必须等前一批 cluster 释放资源后才能继续。
+
+### 4.2 不 PackGQA 时为什么产生大量 tail padding
+
+以 `Q=1084, HQ=16, HKV=1, GQA ratio=16` 为例。
+
+不 pack 时，每个 Q head 单独切 M256 tiles：
+
+```text
+每个 head 的 tiles = ceil(1084 / 256) = 5
+总 work clusters    = 5 × 16 = 80
+
+实际 Q rows         = 1084 × 16 = 17,344
+调度 Q rows         = 80 × 256   = 20,480
+padding             = 3,136 rows = 18.1%
+```
+
+80 clusters 超过单 wave 容量 74：
+
+```text
+wave 0: 74 clusters
+wave 1:  6 clusters  ← 严重低利用率 tail
+```
+
+即使 CLC 能让先结束的 resident cluster steal 后续 work，最后只剩 6 个 work 时，最多也只有 6 个 clusters 在做有效计算。
+
+### 4.3 PackGQA 如何重排 M 维
+
+PackGQA 把同一 KV head 对应的 16 个 Q heads 折入 packed M：
+
+```text
+packed_M = q_tokens × q_heads_per_kv_head
+         = 1084 × 16
+         = 17,344 rows
+
+work clusters = ceil(17,344 / 256) × HKV
+              = 68 × 1
+              = 68
+
+调度 Q rows   = 68 × 256 = 17,408
+padding       = 64 rows = 0.37%
+```
+
+68 clusters 可以全部放进一个 74-cluster wave，消除了 `74+6` 尾波。
+
+PackGQA 不改变下面这些硬件配置：
+
+- physical cluster 仍是 2CTA；
+- 每 CTA 仍拥有 128 packed rows；
+- `UTCQMMA.2CTA` 仍计算 M256；
+- K/V tile 仍是 N128×D256。
+
+它改变的是 Q row 的逻辑含义：M 维现在同时编码 token 与 Q-head，但同一个 packed tile 中的 rows 都属于同一 KV head，因此仍可共享同一 K/V tile。
+
+### 4.4 通用 work-count 公式
+
+设 GQA ratio 为 `R=HQ/HKV`，logical cluster M tile 为 `T=256`：
+
+```text
+unpacked clusters = HKV × R × ceil(Q / T)
+packed clusters   = HKV × ceil(Q × R / T)
+```
+
+两者在没有 tail rounding 时理论 work 相同；PackGQA 的主要收益来自把 `R` 次独立取整改成一次联合取整。
+
+典型边界：
+
+| Q | HQ/HKV | unpacked | packed | 74-cluster waves |
+| ---: | --- | ---: | ---: | --- |
+| 1 | 16/1 | 16 | 1 | 都是 1 wave，但 packed 几乎消除空算 |
+| 128 | 16/1 | 16 | 8 | 都是 1 wave，work 减半 |
+| 256 | 16/1 | 16 | 16 | 无 tail，cluster 数相同 |
+| 1084 | 16/1 | 80 | 68 | `2 waves → 1 wave` |
+| 1084 | 32/2 | 160 | 136 | `3 waves → 2 waves` |
+
+### 4.5 PackGQA 还带来什么
+
+- 减少每个 Q head 独立 tile 的 causal/tail mask 工作；
+- 减少因 padding 产生的无效 QK/PV；
+- 同一 packed tile 内复用 K/V shared-memory operand；
+- 改善 cluster wave 几何和尾部利用率。
+
+但 PackGQA 不保证所有 shape 都减少 cluster 数。`Q` 已对齐 256 时，work count 可能不变；收益要结合 padding、head 数、L2 locality 和 wave boundary 实测。
+
+最终 specialization 让 PackGQA 与 K ping-pong 同时生效：前者减少 work/padding，后者保持 work 内 QK-softmax-PV overlap；只启用其中一个都不能得到当前完整路径。
+
+## 5. Q/K/V 数据搬运：TMA 指令与字节账
+
+### 5.1 当前路径使用的搬运指令
+
+| 数据 | 方向 | CuTe DSL primitive | 典型 SASS | 完成机制 |
+| --- | --- | --- | --- | --- |
+| Q | GMEM→SMEM | `CopyBulkTensorTileG2SOp(CtaGroup.TWO)` + MMA-aware TMA A atom | `UTMALDG.3D.2CTA` | transaction mbarrier |
+| contiguous/page128/page256 K/V | GMEM→SMEM | CTA-group TWO + MMA-aware TMA B atom | `UTMALDG.4D(.2CTA)` | transaction mbarrier |
+| page16/32/64 K/V | GMEM→SMEM | CTA-local page-sized TMA atom | `UTMALDG.4D` | 每 CTA 本地 mbarrier + cluster notification |
+| irregular fallback | GMEM→SMEM | non-bulk async tiled copy | `LDGSTS.E...128` | `cp.async` commit/wait 或 mbarrier |
+| current O | SMEM→register→GMEM | 128-bit `CopyUniversalOp` | `LDS.128` + `STG.E.128` | correction-warp named barrier |
+| regular dense O alternative | SMEM→GMEM | `CopyBulkTensorTileS2GOp` | `UTMASTG` | bulk async-group commit/wait |
+
+PTX ISA 对 `cp.async.bulk.tensor` 的定义是非阻塞 tensor copy，支持 1D–5D、`.cta_group::1/2`、cluster multicast，并以 `mbarrier::complete_tx::bytes` 或 bulk async-group 报告完成。
+
+来源：[PTX ISA — cp.async.bulk.tensor](https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-cp-async-bulk-tensor)
+
+### 5.2 Q：一次 work 只加载一次，64 KB / cluster
+
+logical M tile 为 256 rows：
+
+```text
+Q payload / cluster = 256 × 256 × 1B = 64 KB
+Q payload / CTA     = 128 × 256 × 1B = 32 KB
+```
+
+Q 使用 `CtaGroup.TWO` 的 MMA-aware TMA A atom，生成 `UTMALDG.3D.2CTA`。Q 只在 work-tile 开始时加载一次，然后被所有 K blocks 重用。
+
+关键点：
+
+- TMA destination 与 2CTA QK operand 的 swizzled SMEM layout 直接一致，避免额外 transpose/repack；
+- `q_stage=1`，只有一个 32 KB/CTA sQ buffer；
+- Q TMA 与首个 K TMA 可以并行发出；MMA warp 必须等 Q/K 两个 transaction barrier 后才能发 QK；
+- descriptor 在 kernel 入口由 `UTMACCTL.PF` 预取，避免首个 TMA 暴露 descriptor fetch latency。
+
+### 5.3 K/V：每个 K block 各 32 KB / cluster
+
+每个 logical K block：
+
+```text
+K = 128 tokens × 256 × FP8 = 32 KB / cluster
+V = 128 tokens × 256 × FP8 = 32 KB / cluster
+
+per CTA K slice = 16 KB
+per CTA V slice = 16 KB
+```
+
+K 与 V 的 2CTA 分工不同：
+
+```text
+K: 沿 token/page 维拆
+   CTA0 loads K tokens [0, 64)
+   CTA1 loads K tokens [64, 128)
+
+V: 沿 output-D 维拆
+   CTA0 loads V dims [0, 128)
+   CTA1 loads V dims [128, 256)
+```
+
+这个分工由 2CTA QK/PV 的 B-operand layout 决定，不能把 K 的 source-tile 公式直接用于 V。
+
+### 5.4 page128/page256：一页包含一个或多个 logical tiles
+
+FP8 `tile_n=128`：
+
+```text
+page128: 1 physical page = 1 logical K/V tile
+page256: 1 physical page = 2 logical K/V tiles
+```
+
+page256 必须同时计算：
+
+```text
+tiles_per_page = page_size / tile_n = 2
+logical_page   = n_block / 2
+tile_in_page   = n_block % 2
+```
+
+page table 选择 physical page，`tile_in_page` 再选择该页内部的前/后 128 tokens。只用 `n_block` 索引 page table 或固定页内 offset=0，会让第二个 tile 重复读取第一页的前半部分。
+
+这条路径使用 MMA-aware TMA B atom；一次 logical K 或 V tile 的有效 payload 仍为 32 KB/cluster。
+
+### 5.5 page16/32/64：一个 logical tile 聚合多条 page-sized TMA
+
+small page 无法用一条 tensor tile 跨任意 physical pages，因此为每种 page size 构造 compile-time page-sized descriptor，并对 physical pages 发多条 TMA。
+
+#### K 的每 CTA TMA 数与单条 bytes
+
+| page size | 单条 K TMA tile | bytes / TMA | TMA / CTA | 总 bytes / CTA |
+| ---: | --- | ---: | ---: | ---: |
+| 16 | `16 × D256 × FP8` | 4 KB | 4 | 16 KB |
+| 32 | `32 × D256 × FP8` | 8 KB | 2 | 16 KB |
+| 64 | `64 × D256 × FP8` | 16 KB | 1 | 16 KB |
+
+K 沿 token/page 拆，所以两个 CTA 各负责 logical tile 中一半 pages。
+
+#### V 的每 CTA TMA 数与单条 bytes
+
+| page size | 单条 V TMA tile | bytes / TMA | TMA / CTA | 总 bytes / CTA |
+| ---: | --- | ---: | ---: | ---: |
+| 16 | `D128 × 16 × FP8` | 2 KB | 8 | 16 KB |
+| 32 | `D128 × 32 × FP8` | 4 KB | 4 | 16 KB |
+| 64 | `D128 × 64 × FP8` | 8 KB | 2 | 16 KB |
+
+V 沿 D 拆，所以每个 CTA 都遍历 logical tile 的所有 pages，但只搬自己的一半 D。
+
+最终 page16 的一个 K/V logical block 在 cluster 内动态发出：
+
+```text
+K: 4 TMA/CTA × 2 CTA = 8 TMA, total 32 KB
+V: 8 TMA/CTA × 2 CTA = 16 TMA, total 32 KB
+```
+
+虽然 TMA 条数增加，但它替代了大量 per-thread page pointer、divmod、shuffle 和 `LDGSTS`。最终 SASS 记录中 page16 K/V 有 32 个静态 `UTMALDG.4D` instruction sites、`LDGSTS=0`。
+
+### 5.6 为什么 small page 的多 TMA 仍优于 LDGSTS gather
+
+旧 `LDGSTS` 路径的症状：
+
+```text
+global sectors/request ≈ 13.9
+L1 hit                 ≈ 1.13%
+DRAM SOL               ≈ 2.2%
+主要 stall             long scoreboard
+```
+
+它不是 HBM 带宽满，而是每个线程独立做 page-table/index/address 工作，发出很多不连续 128-bit copy。page-sized TMA 把地址生成提升到 tensor descriptor 层，减少 load-warp 指令并让 5-stage pipeline 更容易隐藏 latency。
+
+选择原则：
+
+- 规则 tile、单次至少数 KB：优先 TMA；
+- arbitrary gather、每行不同 pointer、强细粒度 predicate：保留 `LDGSTS`；
+- 不能为了使用 TMA 而让 masked tail 指向未初始化页；物理 load 必须数值安全；
+- `.3D`/`.4D` 是 descriptor rank，不是性能等级；重点看 TMA 条数、有效 bytes、barrier 和地址指令数。
+
+### 5.7 TMA load 的异步完成协议
+
+GMEM→SMEM TMA 使用 transaction mbarrier：
+
+```text
+producer:
+    wait empty(stage, phase)
+    mbarrier.arrive.expect_tx(total_bytes)
+    issue UTMALDG(..., mbarrier)
+
+hardware:
+    async copy
+    complete_tx(copied_bytes)
+
+consumer:
+    mbarrier.try_wait(stage, phase)
+    read SMEM / issue MMA
+    release stage
+```
+
+PTX ISA 明确规定，TMA 完成时以实际 copy bytes 对 mbarrier 执行 `complete_tx`。因此 `expect_tx` 必须填写该 generation 的总 transaction bytes，而不是 TMA 指令条数。
+
+来源：
+
+- [PTX ISA — mbarrier.expect_tx](https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-mbarrier-expect-tx)
+- [PTX ISA — TMA complete-tx bytes](https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-cp-async-bulk-tensor)
+
+small-page 2CTA 每个 CTA 使用本地 TMA barrier。non-leader 完成本地 TMA 后，再用一次 16-byte cluster remote store 通知 leader；leader barrier 的 expected bytes 需要额外包含这 16 bytes。
+
+TMA `cute.copy()` 本身必须保持 warp-uniform，CUTLASS DSL 会自动选择单线程发射，不应再手工包 `elect_one()`；barrier 初始化和 `expect_tx` 才需要 elect-one。
+
+## 6. Tensor Core：QK 与 PV 都使用 `UTCQMMA.2CTA`
+
+### 6.1 QK 数据路径
+
+```text
+Q: FP8, SMEM, logical shape M256 × K256
+K: FP8, SMEM, logical shape K256 × N128
+S: FP32, TMEM, logical shape M256 × N128
+
+instruction class:
+tcgen05.mma.cta_group::2.kind::f8f6f4
+SASS: UTCQMMA.2CTA
+```
+
+`tcgen05.mma` 的 exact E4M3 types、M/N/K shape 和 accumulate 配置编码在 instruction descriptor (`idesc`) 中。SASS 只显示统一的 `UTCQMMA.2CTA` 类别。
+
+### 6.2 Softmax/P 数据路径
+
+QK 完成后，S 留在 TMEM：
+
+```text
+S TMEM FP32
+    ↓ tcgen05.ld / register fragment
+mask + row max + scale + exp2
+    ↓ FP32 → FP8 E4M3
+P register
+    ↓ tcgen05.st
+P TMEM FP8
+```
+
+softmax 使用 B300 的 native `MUFU.EX2`，最终 reciprocal 使用 `MUFU.RCP`/`rcp_approx`。SM103 tuning 中关闭 software exp2 emulation，避免用额外 ALU 指令替代硬件 MUFU。
+
+### 6.3 PV 数据路径
+
+```text
+P: FP8, TMEM, logical shape M256 × N128
+V: FP8, SMEM, logical shape N128 × D256
+O: FP32, TMEM, logical shape M256 × D256
+
+instruction class:
+tcgen05.mma.cta_group::2.kind::f8f6f4
+SASS: UTCQMMA.2CTA
+```
+
+这正好利用 PTX ISA 支持的 operand placement：A 可以来自 TMEM 或 SMEM，B 来自当前/peer CTA 的 SMEM，D accumulator 位于 TMEM。
+
+来源：[PTX ISA — tcgen05 MMA operand placement](https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-mma)
+
+### 6.4 为什么使用一个 MMA warp
+
+与 `mma.sync`/`wgmma` 的 collective semantics 不同，PTX ISA 规定 `tcgen05.mma` 是 single-thread semantics；一个线程发起即可启动完整 MMA。kernel 仍分配一个 MMA warp，是为了：
+
+- 统一发射 QK/PV；
+- 管理 TMEM allocation/free；
+- 管理 TMA consumer state；
+- 发出 UMMA completion barrier；
+- 避免多个 warp 竞争同一异步 MMA pipeline。
+
+`tcgen05.mma` 是异步指令，不能在发出后立即让 softmax 读取 S 或 correction 读取 O；必须用 UMMA→async mbarrier/`UTCBAR.2CTA.MULTICAST` 完成通知。
+
+## 7. 主流水线：TMA、QK、softmax、PV、correction 的 overlap
+
+### 7.1 两个独立的 pipeline 维度
+
+```text
+q_stage = 1
+    只保留一个 Q tile 和一个 O accumulator
+
+s_pp = 2
+    沿 K-block 方向保留两个 S/P TMEM slots
+
+kv_stage = 5
+    沿 K/V load 方向保留五个 SMEM/TMA stages
+```
+
+`q_stage=1` 不等于没有 double buffering。HD256 的 O accumulator 已占 256 TMEM columns，无法再放第二个 O；但 S/P 仍可以用剩余 256 columns 做两个 128-column ping-pong slots。
+
+#### 三个 stage 参数控制不同资源
+
+```text
+                         M / output direction
+                         ────────────────────►
+q_stage = 1          [ Q tile 0 ] [ O accumulator 0 ]
+                         同一个 work 只有一组 Q/O
+
+                         K-block / time direction
+                         ─────────────────────────►
+s_pp = 2             [ S/P slot 0 ] [ S/P slot 1 ] [ reuse slot 0 ] ...
+                         QK/softmax/PV 在两个 slot 间交替
+
+                         memory-prefetch direction
+                         ─────────────────────────►
+kv_stage = 5         [stage0][stage1][stage2][stage3][stage4]
+                         K/V TMA 与 MMA consumer 的环形队列
+```
+
+三者不能混为一谈：
+
+- 增加 `q_stage` 需要另一份 sQ、sO 和 O TMEM accumulator，HD256 放不下；
+- 增加 `s_pp` 只需要额外 S/P TMEM slot，不复制 O；
+- 增加 `kv_stage` 只增加 K/V SMEM 和 TMA barrier，不增加 TMEM O。
+
+#### S/P slot 的状态机
+
+每个 KPP slot 在一轮中的状态：
+
+```text
+       QK producer                softmax producer              PV consumer
+            │                            │                           │
+            ▼                            ▼                           ▼
+   ┌──────────────┐  S_full    ┌────────────────┐  P_partial  ┌─────────────┐
+   │ QK writes S  │ ─────────► │ read S, write P│ ──────────► │ PV starts   │
+   └──────────────┘             └────────────────┘              │ with P/V    │
+                                            │       P_last      └──────┬──────┘
+                                            └─────────────────────────►│
+                                                                      ▼
+                                                               slot reusable
+```
+
+同一个 TMEM slot 先保存 FP32 S，再在不同 column offset 保存/覆盖为 FP8 P。只有 PV 已消费对应 P generation 后，这个 slot 才能被下一次 QK 复用。
+
+#### 为什么两个 slot 就能 overlap
+
+单 slot 会形成严格串行：
+
+```text
+QK(i) → softmax(i) → PV(i) → QK(i+1)
+```
+
+双 slot 后：
 
 ```text
 slot 0: softmax/PV(i)
 slot 1: QK(i+1)
-    ↓ 下一轮交换
-slot 1: softmax/PV(i+1)
-slot 0: QK(i+2)
 ```
 
-对应两个独立概念：
+QK(i+1) 不依赖 P(i)，它只依赖相同 Q 和新 K(i+1)；因此可以在 softmax warps 处理 S(i) 时由 MMA warp发出。真正的限制是同一个 MMA issue stream 中 QK 与 PV 的发射顺序，以及 O accumulator 在 PV 之间的 correction dependency。
+
+#### 简化时序图
 
 ```text
-q_stage = 同时保留多少个 Q/O tile
-s_pp    = 沿 K 方向保留多少个 S/P slot
+time ─────────────────────────────────────────────────────────────────────►
+
+KV TMA    K0  V0  K1  V1  K2  V2  K3  V3 ...       (5-stage ring prefetch)
+
+MMA       QK0       QK1  PV0       QK2  PV1       QK3  PV2 ...
+           │          │    ▲         │    ▲
+S slot     S0         S1    │        S0    │        S1
+           │          │     │        │     │
+Softmax    └─SM0/P0───┘     │  SM1/P1┘     │  SM0/P2 ...
+                    P0 ready┘       P1 ready┘
+
+Correction init-ready      rescale O0      rescale O1      ...
+                           ▲               ▲
+PV dependency              └─ next PV waits O_rescaled
 ```
 
-当前 HD256 配置为 `q_stage=1, s_pp=2`。
+图中的 `QK1` 与 `SM0/P0` 可以 overlap；`QK2` 与 `SM1/P1` 可以 overlap。PV0 必须等 P0 partial-ready，PV1 还必须等 O0 correction 完成。
 
-#### 关键技巧
+### 7.2 Load warp 的 K/V 发射顺序
 
-- slot 选择必须基于全局 K iteration parity，不能让 causal-mask loop、no-mask loop、末轮各自从 0 开始。
-- softmax、P producer、PV consumer、correction warp 必须对同一个 slot/phase 达成一致。
-- split-P 使一个 P slot 有 partial/full 两次通知，expected arrival 必须匹配。
-- KPP 是否有效要看 tensor active、long scoreboard 和 barrier stall；代码中存在双缓冲不代表硬件真的形成 overlap。
-
-### 6.2 小 trick：persistent CLC 下维护跨 work-tile 的 pipeline epoch
-
-#### 解决的问题
-
-static kernel 中，一个 cluster 通常只处理一个 work，pipeline state 随 block 结束销毁。CLC persistent cluster 会连续处理多个 work：
+K/V 共享 5-stage physical SMEM，load warp 按下面顺序推进 pipeline state：
 
 ```text
-work A: odd number of K blocks
-    ↓ 同一个 resident cluster
-work B: 从哪个 slot / phase 开始？
-```
-
-若 work B 每次假设从 slot0/phase0 开始，work A 的奇数 K-block 会让 producer/consumer generation 错一位，表现为 hang、CUDA 912 或随机精度错误。
-
-#### 怎么做
-
-`60e36fc3` 恢复 CLC KPP 时采用：
-
-1. `kpp_iter_global` 跨 work-tile 保留；
-2. slot 用 global iteration 对 `s_pp` 取模；
-3. barrier phase 显式限制为一位 generation；
-4. work 的 K-block 数为奇数时补一个 dummy slot handshake；
-5. dummy 只闭合 barrier epoch，不发新的 QK/PV MMA；
-6. 下一 work 从完整双 slot 周期开始。
-
-#### 关键技巧
-
-- pipeline phase 是代数状态，不是某个 `for` 循环的局部计数器。
-- dummy handshake 的 producer/consumer commit、wait、release 必须成对；只修 MMA 或 softmax 一侧必然死锁。
-- 先在 CLC 下关闭 KPP、隔离正确性，再恢复 fast path，是处理复合 pipeline bug 的可靠顺序。
-- 必测 odd/even K-block，并确保同一 resident cluster 连续取得多个 CLC work；单 work grid 无法验证。
-
-### 6.3 小 trick：KV pipeline 从 4 stage 加到 5 stage
-
-#### 解决的问题
-
-NCU 显示目标路径并非 DRAM 带宽饱和，而是 K/V 到 shared-memory 的 load latency、long scoreboard 和 barrier 暴露较多。
-
-#### 怎么做
-
-在不改变 residency 的前提下，把 2CTA HD256 KV TMA pipeline 从 4 stage 增加到 5 stage：
-
-```text
-FP8 dynamic shared memory:
-165.888 KB/CTA → 182.272 KB/CTA
-
-occupancy:
-仍为每 SM 一个 CTA，没有下降
-```
-
-#### 收益
-
-代表 shapes 改善约 `0.8%–2.4%`。B4 irregular case 中：
-
-- tensor pipe active：`67.93% → 69.59%`；
-- eligible warps/scheduler：`0.461 → 0.472`；
-- barrier stall/issued：`1.672 → 1.561`。
-
-#### 关键技巧
-
-- stage 增加只有在不降低 residency、且瓶颈确为 load latency 时才有意义。
-- 3 stage 在 2K/16K/64K 退化约 8%/26%/24%；6 stage 对 B=1 基本无收益、B=4 略慢。stage 不是越多越好。
-- 同时测 B=1 长序列和 B=4 irregular；两者对 producer distance 的敏感度不同。
-- 确认 dynamic shared-memory bytes 真正变化，防止 JIT cache 复用旧 specialization。
-
-### 6.4 小 trick：用 sQ/sO 生命周期复用换更多 KV stage
-
-#### 解决的问题
-
-在历史 1CTA kernel 中，Q 在主循环早期消费完，O 只在 epilogue 写入 shared memory，二者生命周期不重叠。分别分配 sQ/sO 会浪费约 32KB shared memory。
-
-#### 怎么做
-
-`083776d8` 让 sQ/sO alias，同一块地址先存 Q、后存 O，从而让 1CTA KV pipeline 由 4 stage 增至 5 stage。
-
-```text
-时间：load/use Q ────┐       write/store O
-                    └─空闲───┘
-空间：[          sQ / sO alias          ]
-```
-
-代表 prefix shapes 改善约 `5.2% / 3.2% / 1.0%`。
-
-#### 关键技巧与当前状态
-
-- 必须证明所有 warp 都不再读 Q，而不只是 MMA warp。
-- persistent loop、提前 epilogue、aux output 都可能延长生命周期。
-- alias 会改变 layout address、对齐和 barrier storage 排布，需整体复核。
-- 当前 2CTA CLC kernel 明确禁止 `overlap_sO_sQ`；persistent/cluster 生命周期不满足原来的不重叠证明。因此这是历史有效 trick，不应直接复制到当前路径。
-
-### 6.5 小 trick：按 warp role 分配寄存器，而不是只看平均值
-
-#### 解决的问题
-
-varlen scheduler、correction、softmax 和 load warp 的局部变量完全不同。只看 kernel 的平均 registers/thread，可能看不到某类低配 warp 已发生 stack spill。
-
-#### 怎么做
-
-原型 CLC+LPT 调优中，把寄存器从 correction warp 向其他 warp 重分配：
-
-```text
-correction warp: 80 → 72
-other warp:      48 → 56
-```
-
-目标不是减少总寄存器，而是让 scheduler 临时状态不落入 local memory。
-
-#### 关键技巧
-
-- 用 SASS/SourceCounters 检查 `LDL/STL`，不要只看 occupancy 表。
-- scheduler 修改后要重新检查各 role 的 spill；增加一个坐标或 divmod 可能只伤害 load/scheduler warp。
-- 寄存器重分配和 threads/block、warp role 数绑定，不能从 1CTA 机械迁移到 2CTA。
-
-### 6.6 小 trick：split-P 让 PV 提前启动，但只保留有证据的切分点
-
-#### 原理
-
-softmax warp 可以先写一部分 P，发 partial-ready，让 PV 提前开始，再写剩余列并发 full-ready：
-
-```text
-write P[0:split] → partial arrival → PV begins
-write P[split:N] → full arrival
-```
-
-#### 实验结论
-
-- 当前 2CTA 默认 75%；
-- 75%→50% 只有约 `-0.3%～+0.1%`，基本中性；
-- 25% 触发 SM launch failure；
-- 因此保留 75%。
-
-#### 关键技巧
-
-- split point 同时影响 overlap、barrier arrival 数和消费者最小连续工作量，不只是一个性能常量。
-- 1CTA 的最优值不能直接迁移到 2CTA；pair-UMMA 和 cluster barrier 改变了消费节奏。
-- 必测短 K、长 K、奇数 block count 和 causal 边界。
-
-## 7. 大优化点四：Paged-KV 数据搬运与寻址
-
-Paged-KV 的优化重点不是“减少 K/V payload”——多数 case 的 payload 已接近必要量——而是减少 gather 指令、地址依赖、重复 page-table load 和不安全的 masked load。
-
-### 7.1 小 trick：先按数据形状选择搬运原语，不要只看指令名字
-
-同样是 GMEM/SMEM 搬运，CuTe DSL 可以生成 TMA、non-bulk `cp.async`、普通 vector load/store 等不同指令。它们的功能有重叠，但寻址方式、发射线程、同步协议和固定成本不同。
-
-#### 选择表
-
-| 数据传输需求 | 优先原语 | 常见 SASS | 优点 | 主要代价/限制 |
-| --- | --- | --- | --- | --- |
-| 规则多维 GMEM→SMEM tile | Tensor TMA load | `UTMALDG.{N}D` | 单次描述大 tile，地址/指令开销低，适合深 pipeline | 需要 descriptor、规则 tile 和 mbarrier；小传输固定成本高 |
-| 2CTA UMMA 的规则 operand | CTA-group TWO Tensor TMA | `UTMALDG.{N}D.2CTA` | descriptor/layout 与 2CTA MMA operand 对齐 | barrier bytes、cluster layout 必须匹配；并不自动等于 multicast |
-| 同一 GMEM tile 被 cluster 多 CTA 复用 | multicast Tensor TMA | TMA multicast variant | 一次读取可投递多个 CTA 的 SMEM，减少重复 payload | 需要 multicast op、mask、remote SMEM 和 cluster 同步；仅适合消费者数据完全相同 |
-| 规则 SMEM→GMEM tile | Tensor TMA store | `UTMASTG` | 消除大量逐线程 store，降低 epilogue 指令和寄存器压力 | 输出必须能表达成规则 descriptor tile；完成协议是 bulk commit/wait |
-| 不规则、逐行 predicated GMEM→SMEM | non-bulk `cp.async` | `LDGSTS` | 每线程地址灵活，容易处理 gather、ragged 和细粒度 predicate | 指令与地址计算多，容易 long-scoreboard；warp 要共同搬完整 tile |
-| 小块、强 predicate、SMEM→GMEM | vector register copy | `LDS` + `STG` 等 | 最灵活，可处理 PackGQA/ragged row 映射 | 占寄存器、指令多，可能 spill |
-| 规则连续 byte range、无需 tensor descriptor | bulk non-tensor copy | bulk `cp.async` variant | 比逐线程 copy 更粗粒度，不需要多维 tensor map | 不能自动做多维坐标/边界映射；当前 HD256 主路径没有使用 |
-
-#### 不要用 SASS 维度数直接判断快慢
-
-`UTMALDG.3D`、`UTMALDG.4D` 中的 3D/4D 主要反映 tensor descriptor 和坐标的 rank，不是性能等级：
-
-- Q 在当前 kernel 中通常生成 `UTMALDG.3D.2CTA`；
-- small-page K/V 的 tensor 含 page/head/physical-page 等维度，生成 `UTMALDG.4D`；
-- contiguous 或大页 K/V 还可能生成 `UTMALDG.4D.2CTA`。
-
-同样 payload 下，较少动态坐标和较低 descriptor rank 可能减少少量寻址工作，但真正决定性能的是：
-
-```text
-每个 logical tile 发多少条 TMA
-每条 TMA 搬多少有效 bytes
-是否重复读取相同 payload
-是否需要跨 CTA multicast/notification
-mbarrier 和 pipeline 是否隐藏了 latency
-是否为了使用 TMA 而搬了大量会被 mask 的无效数据
-```
-
-因此不能仅看到 `.3D` 就认定优于 `.4D`，也不能仅看到 `.2CTA` 就认定比单 CTA TMA 快。
-
-#### 当前 kernel 的调用方式与生成指令
-
-| 数据 | CuTe DSL 构造方式 | 发射方式 | 典型 SASS |
-| --- | --- | --- | --- |
-| Q | `CopyBulkTensorTileG2SOp(CtaGroup.TWO)` + `make_tiled_tma_atom_A(...)` | `tma_get_copy_fn()` 后传 `tma_bar_ptr` | `UTMALDG.3D.2CTA` |
-| contiguous/page128/page256 K/V | CTA-group TWO op + `make_tiled_tma_atom_B(...)` | `tma_partition()` + `cute.copy(...)` | `UTMALDG.4D(.2CTA)` |
-| page16/32/64 K/V | 默认 CTA-group ONE op + 通用 `make_tiled_tma_atom(...)`，descriptor tile 等于一个 physical page | 每 CTA 对自己负责的 page 循环 `cute.copy(...)` | `UTMALDG.4D` |
-| dense/规则 O | `CopyBulkTensorTileS2GOp()` + `make_tiled_tma_atom(...)` | `cute.copy()` + bulk commit/wait | `UTMASTG` |
-| 当前 varlen/PackGQA O | `CopyUniversalOp` 组成 128-bit tiled copy | sO→register→GMEM，逐 row predicate | `LDS/STG` 类指令 |
-
-这里的 `make_tiled_tma_atom_A/B` 是 MMA-aware helper：它根据 MMA operand、CTA layout 和 SMEM layout 构造 TMA atom，适合规则 Q/K/V operand。通用 `make_tiled_tma_atom` 则允许显式指定 `(page_size, head_dim)` 这样的 physical-page tile，更适合 small-page specialization。
-
-这两类 helper 都在 JIT 编译阶段构造 descriptor/layout，本身没有 Python runtime 调用开销。性能差异来自最终生成的 descriptor、TMA 条数、搬运范围和同步，而不是函数名字。
-
-#### TMA load 的正确发射协议
-
-规则 GMEM→SMEM TMA 的基本结构是：
-
-```python
-op = cpasync.CopyBulkTensorTileG2SOp(cta_group)
-tma_atom, tma_tensor = cpasync.make_tiled_tma_atom(
-    op, gmem_tensor, smem_layout, tile_shape
-)
-
-# kernel 开始时预取 descriptor
-if warp_idx == 0:
-    cpasync.prefetch_descriptor(tma_atom)
-
-# 每个 pipeline stage 先设置预计 transaction bytes
-with cute.arch.elect_one():
-    cute.arch.mbarrier_arrive_and_expect_tx(barrier, tx_bytes)
-
-# TMA copy 本身不要再包 elect_one；DSL 会自动选一个线程发射
-cute.copy(
-    tma_atom,
-    gmem_tile,
-    smem_tile,
-    tma_bar_ptr=barrier,
-)
+K0 → Q → V0 → K1 → V1 → K2 → V2 → ...
 ```
 
 关键点：
 
-- `cute.copy(tma_atom, ...)` 必须保持 warp-uniform，不要手工包 `with elect_one()`；当前 CUTLASS DSL 会隐式选择发射线程，重复 elect 可能导致错误或 deadlock。
-- barrier 初始化和 `expect_tx` 仍需要 `elect_one()`。
-- `tx_bytes` 不是“发了几条 TMA”，而是该 barrier generation 预期完成的总字节数。
-- 多 page/多 TMA 共用一个 stage barrier 时，必须把所有 transaction bytes 相加。
-- current small-page 2CTA 路径中，每个 CTA 先等待自己的 TMA barrier；non-leader 再用一次 16-byte cluster remote store 通知 leader，因此 leader 的 expected bytes 还要包含这 16 bytes。
-- descriptor 在 kernel 入口预取一次，可以避免第一次 TMA issue 暴露 descriptor fetch latency；不要在每个 K block 重复 prefetch。
+- Q 只加载一次；
+- K 与 V 分别占用连续 pipeline generations；
+- MMA warp 在使用 V(i) 时保持该 stage 不释放；
+- 同时等待/消费下一 stage 的 K(i+1)，发出 QK(i+1) 后立即释放 K stage；
+- 5 stages 给 load warp 足够距离预取后续 K/V，不降低当前一 CTA/SM residency。
 
-#### TMA store 使用另一套完成协议
+stage 4→5 的实测收益为 `0.8%–2.4%`；3 stages 无法隐藏 latency，16K/64K 可退化约 26%/24%；6 stages 没有进一步收益并增加同步/资源压力。
 
-SMEM→GMEM TMA store 不使用 load-side 的 transaction mbarrier。典型调用为：
+### 7.3 K-direction ping-pong 的 steady state
+
+初始阶段：
+
+```text
+1. wait Q ready
+2. wait K0 ready
+3. issue QK0 → S slot 0
+4. signal S0 ready
+```
+
+稳定迭代 `i`：
+
+```text
+MMA warp                         Softmax warps                    Correction warps
+──────────────────────────────   ──────────────────────────────   ──────────────────────
+hold V(i) stage
+wait K(i+1)
+issue QK(i+1) → S slot next  ──► wait S(i)
+release K(i+1) stage             TMEM→register load S(i)
+                                  causal mask / row max
+                                  MUFU.EX2 + row sum
+                                  FP32→FP8 P(i)
+                                  register→TMEM store P(i)
+wait P(i) partial-ready       ◄── signal P(i) at 75%
+wait O accumulator rescaled   ◄────────────────────────────────── rescale O(i-1) if needed
+issue PV(i) → O TMEM          ──────────────────────────────────► wait O(i) ready
+signal O(i) full
+release V(i) stage
+                                  finish/write last 25% P(i)
+```
+
+与此同时 load warp 正在用 TMA 预取更远的 K/V stages；CLC response 也可由 leader CTA 的 load warp 在空隙中预取。
+
+#### 代码层：MMA 是 S producer、P consumer
+
+下面是当前 `mma()` fast path 的简化形式：
 
 ```python
-store_O(src_idx=stage, dst_idx=stage)
-cute.arch.cp_async_bulk_commit_group()
+# 跨 CLC work 保留，不能每个 work 清零
+kpp_iter_global = 0
 
-# 复用 sO buffer 前，等待对应 store group 已完成读取 shared memory
-cute.arch.cp_async_bulk_wait_group(pending_groups, read=True)
+# 第一个 K block
+pipeline_q.consumer_wait_w_index_phase(0, q_phase)
+pipeline_kv.consumer_wait(kv_state)                  # wait K0
+s_slot = kpp_iter_global % 2
+gemm_Si[s_slot](K0)                                  # async QK0
+pipeline_s_full_kpp.producer_commit_w_index(s_slot) # QK completion → softmax
+pipeline_kv.consumer_release(kv_state)
+kv_state.advance()
+
+for i in range(num_k_blocks - 1):
+    pipeline_kv.consumer_wait(kv_state)              # hold V(i)
+    v_state = kv_state.clone()
+    kv_state.advance()
+
+    pipeline_kv.consumer_wait(kv_state)              # wait K(i+1)
+    k_state = kv_state.clone()
+    next_slot = (kpp_iter_global + i + 1) % 2
+    gemm_Si[next_slot](K_next)                        # async QK(i+1)
+    pipeline_s_full_kpp.producer_commit_w_index(next_slot)
+    pipeline_kv.consumer_release(k_state)
+    kv_state.advance()
+
+    # 当前 P(i) 和上一轮 corrected O 都 ready 后才能 PV
+    pipeline_p_full_kpp.consumer_wait(p_state)
+    pipeline_o_rescaled_kpp.consumer_wait(o_rescaled_state)
+    gemm_Pi[cur_slot](P_i, V_i, lastsplit_mbarrier)  # async PV(i)
+    pipeline_o_acc.producer_commit_w_index(0)        # PV completion → correction
+
+    pipeline_p_full_kpp.consumer_release(p_state)
+    pipeline_o_rescaled_kpp.consumer_release(o_rescaled_state)
+    pipeline_kv.consumer_release(v_state)
+    p_state.advance()
+    o_rescaled_state.advance()
 ```
 
-`read=True` 的意义是确保 TMA store 已经读完 sO，之后 producer 才能安全复用该 shared-memory stage。若只等待“全局写最终可见”而忽略 sO 生命周期，persistent epilogue 可能覆盖尚未被 TMA 读取的数据。
+这里有两个容易忽略的点：
 
-#### `.2CTA` 与 multicast 的区别
+1. V(i) stage 在 QK(i+1) 期间保持 occupied，因为随后 PV(i) 仍要读 V(i)；
+2. K(i+1) 只用于 QK，QK 发出并建立正确 completion dependency 后即可 release，从而让 TMA producer 更早复用该 SMEM stage。
 
-当前 `CopyBulkTensorTileG2SOp(CtaGroup.TWO)` 选择的是 Blackwell 2SM/2CTA TMA 形式，用来匹配 2CTA MMA operand 和 cluster layout。它不等价于把同一 tile multicast 给两个 CTA。
+#### 代码层：softmax 是 S consumer、P producer
 
-真正的 multicast 需要：
+当前 `softmax_step()` 的简化形式：
 
 ```python
-op = cpasync.CopyBulkTensorTileG2SMulticastOp(cta_group)
-tma_atom, tma_tensor = cpasync.make_tiled_tma_atom(
-    op, gmem_tensor, smem_layout, tile_shape,
-    num_multicast=cluster_size,
-)
-cute.copy(
-    tma_atom.with_(mcast_mask=cluster_mask),
-    gmem_tile,
-    smem_tile,
-    tma_bar_ptr=barrier,
-)
+# slot/phase 来自 global K iteration
+pipeline_s_full_kpp.consumer_wait_w_index_phase(s_slot, s_phase)
+pipeline_p_full_kpp.producer_acquire_w_index_phase(s_slot, p_phase)
+
+# TMEM S → registers
+cute.copy(tmem_load_atom, S_tmem, S_regs)
+apply_causal_mask(S_regs)
+row_max, acc_scale = online_softmax_update_max(S_regs)
+
+# 先把 acc_scale 交给 correction
+sScale[row] = acc_scale
+sm_stats_barrier.arrive_w_index(...)
+
+P_regs = exp2_and_cast_e4m3(S_regs, row_max, max_offset=4)
+
+for fragment in P_fragments:
+    cute.copy(tmem_store_atom, P_regs[fragment], P_tmem[fragment])
+    if fragment_reaches_75_percent:
+        cute.arch.fence_view_async_tmem_store()
+        cute.arch.sync_warp()
+        pipeline_p_full_kpp.producer_commit_w_index(s_slot)
+
+# 后 25% 完成
+cute.arch.fence_view_async_tmem_store()
+cute.arch.sync_warp()
+pipeline_p_full_lastsplit_kpp.producer_commit_w_index(s_slot)
 ```
 
-只有当多个 CTA 需要完全相同的 GMEM tile、各自 SMEM layout 兼容，并且节省的重复 payload 大于 multicast/remote synchronization 成本时，multicast 才值得使用。当前 small-page K/V 路径是 CTA-local 分工：K 按 token/page 拆，V 按 D 拆，两个 CTA 需要的目标 slice 不相同，因此选择多个 CTA-local TMA，而不是强行 multicast。
+`producer_acquire` 防止 softmax 覆盖仍被前一轮 PV 使用的 P slot；`S consumer_wait` 防止在 QK 完成前读取 S；TMEM async fence 保证 arrival 之前对应 P stores 对 MMA 可见。
 
-#### TMA 与 `LDGSTS` 的实用选择流程
+#### 代码层：correction 是 O consumer、O-rescaled producer
+
+```python
+# 第一轮没有旧 O 需要 rescale，先发一个 ready token
+pipeline_o_rescaled_kpp.producer_acquire_w_index_phase(0, phase)
+pipeline_o_rescaled_kpp.producer_commit_w_index(0)
+
+for i in range(num_k_blocks - 1):
+    sm_stats_barrier.arrive_and_wait_w_index(...)    # wait acc_scale
+    scale = sScale[row]
+
+    pipeline_o_acc.consumer_wait_w_index_phase(0, o_phase)  # wait PV O_full
+    if warp_vote_any(scale < 1.0):
+        correction_rescale_O_in_tmem(scale)
+
+    pipeline_o_rescaled_kpp.producer_acquire_w_index_phase(0, phase)
+    pipeline_o_rescaled_kpp.producer_commit_w_index(0)       # next PV may accumulate
+    pipeline_sm_stats.consumer_release_w_index(0)
+```
+
+第一轮的 artificial ready token 很重要：PV0 之前不存在旧 O，不需要 correction，但 MMA consumer 仍使用统一的 `O_rescaled` protocol。
+
+#### index 与 phase 如何推进
+
+两-slot ring 的状态可写成：
 
 ```text
-数据能否表示为 compile-time tile + 少量 runtime tensor coordinates？
-    否 → 使用 LDGSTS / vector copy
-    是
+global_iter  slot = iter % 2  phase = (iter / 2) & 1
+     0              0                  0
+     1              1                  0
+     2              0                  1
+     3              1                  1
+     4              0                  0
+```
+
+slot 决定访问哪个 mbarrier/TMEM region，phase 区分同一 slot 的不同 generation。只有 slot 没有 phase，会把 iteration 2 误认为 iteration 0 已完成；只有 phase 没有 slot，则无法同时保留两个在飞的 S/P。
+
+### 7.4 overlap 的实质
+
+理想 steady state 同时存在五类工作：
+
+```text
+TMA:         load K/V(i+2, i+3, ...)
+Tensor Core: QK(i+1)
+SIMT/MUFU:   softmax + P cast(i)
+Tensor Core: PV(i)
+SIMT/TMEM:   O correction(i-1)
+```
+
+这不是让 QK 与 PV 在同一个 Tensor Core 上完全并发；二者仍由同一 MMA warp 排序发射。收益来自异步 `tcgen05.mma` 与不同执行单元/warp 的重叠：MMA warp 发出操作后，softmax/correction/load warps 可以独立工作，barrier 只在真正的数据依赖处阻塞。
+
+### 7.5 split-P：75% 时提前启动 PV
+
+`split_P_arrive = 96`，即 N128 的 75%。softmax warps 写 P TMEM 时：
+
+```text
+write P columns [0, 96)
+fence async TMEM store
+signal P partial-ready
     ↓
-每次能否搬一个有足够有效 bytes 的规则 tile？
-    否 → 小传输下 TMA 固定成本可能不划算，A/B 测 LDGSTS
-    是
+MMA warp 可以开始 PV
     ↓
-多个 CTA 是否消费相同 payload？
-    是 → 评估 multicast TMA
-    否 → CTA-local TMA 或 CTA-group TWO TMA
+write P columns [96, 128)
+signal P last-split-ready
+```
+
+PV 的 partial MMA 路径带 last-split mbarrier，确保需要后 32 columns 时数据已经可见。
+
+实验结果：
+
+- 75%→50% 只有 `-0.3%～+0.1%`，基本中性；
+- 25% 触发 SM launch failure；
+- 当前保留 75%。
+
+split point 不是纯性能常量，它同时改变 TMEM producer fence、partial/full arrival 次数和 PV consumer 的合法同步节奏。
+
+### 7.6 online-softmax correction 如何与 PV 配合
+
+softmax 每处理一个新 K block，会更新 running row max。若 max 变化，已有 O accumulator 必须乘：
+
+```text
+acc_scale = exp(old_max - new_max)
+```
+
+流水线为：
+
+```text
+softmax warps:
+    计算 acc_scale
+    写 sScale
+    named-barrier 通知 correction
+
+MMA warp:
+    PV 完成后 signal O_full
+
+correction warps:
+    wait softmax scale
+    wait O_full
+    TMEM→register load O fragment
+    packed FP32 multiply by acc_scale
+    register→TMEM store
+    fence_view_async_tmem_store
+    signal O_rescaled
+
+MMA warp:
+    下一次 PV 前 wait O_rescaled
+```
+
+`should_rescale` 是 warp-wide ballot：任意一行需要 rescale，整个 warp 都执行。因此尝试只在少数迭代跳过 correction wait 几乎没有收益。
+
+### 7.7 KPP phase 是 persistent-cluster 状态
+
+KPP 的 S/P slot、phase 和 producer/consumer state 都在 work loop 外创建，不能在取得新 CLC work 时清零。完整的 physical cluster、logical work、CLC KPP 和 odd-block dummy handshake 见 10.7～10.9。
+
+## 8. 同步设计：只在真实数据依赖处等待
+
+### 8.1 同步关系总表
+
+| Pipeline / barrier | Producer | Consumer | 保护的数据 | 等待点 |
+| --- | --- | --- | --- | --- |
+| Q TMA pipeline | load warp / TMA | MMA warp | sQ | 首次 QK 前 |
+| K/V 5-stage TMA pipeline | load warp / TMA | MMA warp | sK/sV stage | 对应 QK/PV 前 |
+| `S_full_kpp[2]` | MMA warp | softmax warps | S TMEM slot | softmax 读 S 前 |
+| `P_full_kpp[2]` | softmax warps | MMA warp | P 前 75% | PV 启动前 |
+| `P_lastsplit_kpp[2]` | softmax warps | PV MMA | P 后 25% | PV 使用后半 P 前 |
+| `O_full` | MMA warp | correction warps | O TMEM accumulator | correction 读 O 前 |
+| `O_rescaled` | correction warps | MMA warp | rescaled O TMEM | 下一次 PV 前 |
+| softmax stats named barrier | softmax warps | correction warps | `acc_scale/row_sum/row_max` | correction/最终 normalize 前 |
+| epilogue named barrier | 4 correction warps | 同一组 correction warps | sO tile | LDS/STG 前 |
+| cluster init barrier | CTA0/CTA1 | 全体 pipeline | mbarrier/TMEM/cluster state | 第一个 work 前 |
+| CLC response mbarrier | hardware CLC request | cluster scheduler | 16-byte response | advance work 前 |
+
+### 8.2 哪些操作是异步的
+
+- `UTMALDG.*`：异步 GMEM→SMEM，硬件完成后对 transaction mbarrier 做 `complete_tx(bytes)`；
+- `UTCQMMA.2CTA`：异步 Tensor Core MMA；
+- `tcgen05.st`：register→TMEM 属于 async proxy，需要 `fence_view_async_tmem_store`；
+- CLC cancellation/fetch：异步返回 16-byte response，通过 shared mbarrier 同步；
+- cluster remote store：异步写 peer/leader CTA 的 shared/barrier state。
+
+### 8.3 哪些位置必须同步
+
+1. MMA 读取 sQ/sK/sV 前，必须等对应 TMA generation 完成。
+2. softmax 读取 S TMEM 前，必须等 QK UMMA 完成。
+3. PV 读取 P TMEM 前，必须等 partial P fence/arrival；读后 25% 前还要等 last-split。
+4. correction 修改 O 前，必须等本轮 PV 写 O 完成。
+5. 下一轮 PV 累加 O 前，必须等 correction 写回 TMEM 完成。
+6. epilogue 读 O 前，必须等最后一次 PV 和 correction 完成。
+7. sO→GMEM 前，四个 correction warps 必须确认整块 sO 已写完。
+8. TMEM free 前，MMA、softmax、correction 全部 warp 必须到达 allocation barrier。
+
+### 8.4 常见错误
+
+- 在 TMA `cute.copy()` 外再套 `elect_one()`：DSL 已隐式单线程发射，可能破坏同步。
+- `expect_tx` 填 TMA 数量而非 bytes：barrier 永远不能正确完成。
+- 只同步本 CTA，不包含 peer CTA 的 softmax/correction producer 数：2CTA barrier 提前完成。
+- TMEM store 后没有 async-proxy fence：MMA 可能读到旧 P/O。
+- work 边界重置 phase：CLC persistent 下跨 work 死锁。
+- 提前释放 V stage：PV 尚未完成就被后续 K/V TMA 覆盖。
+
+PTX 依据：
+
+- [tcgen05 asynchronous operations](https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-memory-consistency-model-async-operations)
+- [tcgen05 pipelined instructions](https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-memory-consistency-model-pipelined-instructions)
+- [mbarrier](https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-mbarrier)
+
+## 9. Epilogue：FP32 TMEM → BF16 GMEM
+
+### 9.1 当前 epilogue 的完整路径
+
+每个 CTA 输出 128 rows：
+
+```text
+O payload / CTA     = 128 × 256 × 2B = 64 KB
+O payload / cluster = 256 × 256 × 2B = 128 KB
+```
+
+最终路径：
+
+```text
+O FP32 accumulator in TMEM
+    ↓ wait final O_full
+tcgen05.ld → register fragment
+    ↓ multiply final_scale = rcp(row_sum) × v_descale
+packed FP32 multiply
+    ↓ FP32 → BF16 conversion
+register → sO
+    ↓ fence_view_async_shared
+4 correction warps named-barrier
     ↓
-边界是否会读取未初始化/NaN 数据？
-    是 → descriptor 边界、safe page 或显式 predicated fallback
+sO → register via 128-bit LDS
     ↓
-用 SASS + NCU 确认：TMA 条数、有效 bytes、barrier stall、long scoreboard
+register → GMEM via 128-bit STG
 ```
 
-对当前 HD256 workload，经验是：
+典型 SASS 为 `LDS.128` + `STG.E.128`。四个 correction warps 同时负责：
 
-- Q 和规则 contiguous/大页 K/V：优先 MMA-aware TMA；
-- page16/32/64：优先按 physical page 构造多个小 TMA，而不是逐线程 gather；
-- 真正任意 page gather、逐行不规则地址或复杂 predicate：保留 `LDGSTS`；
-- dense/aligned O：优先 TMA store；PackGQA/ragged O 在 descriptor 无法自然表达时使用 vector epilogue，或重新设计 ragged descriptor，而不是强开 TMA。
+- 最终 normalize；
+- FP32→BF16 conversion；
+- TMEM→SMEM 搬运；
+- PackGQA row/head 地址还原；
+- varlen row predicate；
+- GMEM vector store。
 
-#### 判断 TMA 是否真的更快，要同时看五项指标
+这样可以复用 correction warps 的寄存器和线程，避免独立 epilogue warp。
 
-1. **TMA issue 数**：把一个 tile 拆成过多小 TMA，可能把 descriptor/barrier 固定成本放大。
-2. **有效字节比例**：TMA 搬得大但多数被 mask，未必优于 predicated `LDGSTS`。
-3. **地址指令数**：TMA 的主要收益之一是减少 per-thread pointer/divmod/gather 指令。
-4. **同步成本**：long-scoreboard 下降但 barrier stall 大增时，wall time 可能不变。
-5. **pipeline overlap**：只有 consumer 能在后续 stage 工作时，异步搬运才能隐藏 latency。
+### 9.2 为什么必须经过 sO
 
-当前 small-page 优化就是一个完整例子：`LDGSTS` 路径 DRAM SOL 很低但 long-scoreboard 高；换成 page-specialized `UTMALDG.4D` 后，静态 `LDGSTS` 从 32 个降到 0，并在最终矩阵中获得稳定收益。这说明收益来自减少地址/指令与改善 overlap，不是因为 TMA 的理论带宽一定更高。
+TMEM 适合 Tensor Core accumulator，但普通 global store 不能直接从 TMEM 发出。中间使用 sO 有三个作用：
 
-### 7.2 小 trick：page128/256 使用一页多 tile 的 TMA
+1. 把 tcgen05 TMEM fragment 重排成连续 128-bit GMEM vector layout；
+2. 在 shared-memory store 时完成 FP32→BF16 conversion；
+3. 让四个 correction warps 合作生成完整 output tile，再统一进行 coalesced global store。
 
-#### 解决的问题
+`fence_view_async_shared` 只保证 async shared writes 的视图顺序；它不替代线程间 barrier。因此后面仍需要 128-thread named barrier，确保所有 warp 的 sO 分片都完成。
 
-早期实现隐含 `page_size == tile_n`：page-table 直接用 `n_block` 索引，页内 tile 固定为 0。对 FP8 `tile_n=128`：
+### 9.3 当前为什么不用 TMA O-store
 
-- page128 恰好正确；
-- page256 的第二个 KV tile 会重复读取该页前 128 tokens；
-- 通用 gather 路径又有大量 LSU 指令和地址计算。
-
-#### 怎么做
-
-`fe0a5c5c` 对 `page_size >= tile_n` 使用：
+规则 dense O 可以使用：
 
 ```text
-tiles_per_page = page_size / tile_n
-logical_page   = n_block / tiles_per_page
-tile_in_page   = n_block % tiles_per_page
-physical_page  = page_table[logical_page]
+CopyBulkTensorTileS2GOp
+    → UTMASTG
+    → cp.async.bulk.commit_group
+    → cp.async.bulk.wait_group.read
 ```
 
-TMA descriptor 选择 physical page，source tile 再使用 `tile_in_page` 选择页内偏移。
+但当前输出同时有 PackGQA 与 packed varlen：
 
-#### 收益
+- packed M row 需要还原为 `(token, q_head)`；
+- sequence base 由 runtime `cu_seqlens_q` 决定；
+- 最后一个 tile 有逐 row predicate；
+- 一个规则 dense descriptor 不能自然表达所有地址映射。
 
-32K prefix 代表 case：
+所以当前选择 vector epilogue，而不是强开 TMA。
+
+### 9.4 TMA store 与 TMA load 的同步不同
+
+TMA load 使用 transaction mbarrier；TMA store 使用 bulk async-group：
 
 ```text
-LSU traffic: 168.9M → 13.0M（约 13 倍下降）
-tensor pipe: 67.7%  → 76.3%
-latency:     3200us → 2980us
+issue UTMASTG
+cp.async.bulk.commit_group
+cp.async.bulk.wait_group.read N
 ```
 
-这表明旧路径主要受 gather 指令、地址计算和 load latency 限制，而不是 HBM 带宽饱和。
+`wait_group.read` 用于确认 TMA store 已读完 sO，之后该 shared-memory stage 才能安全复用。它不是 load-side `expect_tx/complete_tx` 协议。
 
-#### 关键技巧
+## 10. Causal 调度：LPT + Cluster Launch Control
 
-- page table 永远以 page 为单位，不能直接用 tile ID。
-- page256 是验证 `tile_in_page` 的必要 case；只测 page128 无法覆盖页内第二 tile。
-- page size 必须进入 compile key，因为它改变 descriptor 和 source layout。
-- 使用 shuffled physical page table；identity mapping 会让忽略 page table 的错误实现也可能通过。
+### 10.1 先定义 work、K block、cluster 和 wave
 
-### 7.3 小 trick：page16/32/64 使用一 tile 多页的 page-specialized TMA
+当前 scheduler 返回的 logical work 坐标是：
 
-#### 解决的问题
-
-small page 早期走 `PagedKVManager + LDGSTS/cp.async` gather。典型 NCU 症状为：
-
-```text
-global sectors/request ≈ 13.9（理想约 4）
-L1 hit                 ≈ 1.13%
-L2 hit                 ≈ 78.4%
-DRAM read SOL          ≈ 2.2%
-主要 stall             long scoreboard
+```python
+m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
 ```
 
-DRAM 利用率很低，说明问题是大量不连续小 load、page-table/index 指令和 load latency，而非带宽。
-
-#### 怎么做
-
-`526b741e` 为 page size 做 compile-time specialization，把一个 logical tile 拆成多个 TMA transaction：
+一个 work 表示：
 
 ```text
-FP8 tile N=128:
-    page16 → 8 个 page transaction
-    page32 → 4 个 page transaction
-    page64 → 2 个 page transaction
-
-BF16 tile N=64:
-    page16 → 4 个 page transaction
-    page32 → 2 个 page transaction
-    page64 → 1 个 page transaction
+一个 packed-M256 Q/O tile
+× 一个 KV head
+× 一条 sequence
+× 该 tile 对应的 causal K-block range
 ```
 
-2CTA 内保持明确分工：
+它不是一个 K block，也不是一个 CTA：
 
-- K load 按 KV token/page 范围分给 CTA0/CTA1；
-- V load 按输出 D 范围分给 CTA0/CTA1；
-- QK/PV 仍由 `UTCQMMA.2CTA` 完成完整 HD256 运算；
-- 每个 CTA 使用本地 TMA barrier；
-- non-leader 完成全部本地 TMA 后，以 cluster async store 通知 leader。
+- **K block** 是 work 内层循环的一次 KV128 迭代；一个 work 通常包含多个 K blocks。
+- **physical cluster** 是执行 work 的硬件执行组，固定为两个 CTA：CTA0 负责 packed rows `[0,128)`，CTA1 负责 `[128,256)`。
+- **work** 是逻辑任务坐标；同一个 physical cluster 在 persistent loop 中可以先后处理多个 work。
+- **wave** 是某一时刻可同时 resident 的 physical clusters 集合。B300 有 148 SM，而当前资源占用使每个 CTA 独占一个 SM，所以一 wave 最多为 74 个 2CTA clusters。
 
-#### 收益
-
-最终 FP8 page16/32/64 验证矩阵：
+关系可以画成：
 
 ```text
-60/60 finite
-60/60 correct
-60/60 faster than 当时 nightly TRTLLM-gen
-speedup 1.090x–1.338x
+logical work W(m, hkv, batch, split)
+│
+├─ Q/O ownership: packed M256 × D256
+│    ├─ CTA0: rows   0..127
+│    └─ CTA1: rows 128..255
+│
+└─ K loop: K0, K1, ... K(n-1), each KV128
+
+one physical cluster = CTA0 + CTA1 = one work at a time
+one physical cluster lifetime = zero or more consecutive works
+one wave on B300 = at most 74 such physical clusters resident together
 ```
 
-SASS 验证包含 `UTCQMMA.2CTA` 和 `UTMALDG.4D`，`LDGSTS=0`，证明收益不是通过回退 1CTA 或重打包 page128 获得。
+PackGQA 改变 logical work 的数量和每个 work 中 row→Q-head 的映射，但不改变 `cluster=(2,1,1)`，也不把一个 work 拆成两个独立 CTA work。
 
-#### 关键技巧
+### 10.2 causal work 的计算量不相等
 
-- small page 不等于只能 gather；只要 page size 是 compile-time specialization，就可以聚合多次 TMA。
-- K 和 V 的 CTA 分工不同，不能复用同一个 source-tile 公式。
-- 每 CTA barrier 的 transaction bytes 必须等于本 CTA 实际发出的 TMA 总量。
-- remote notification 必须在本 CTA 全部 TMA 完成之后。
-- 新 page size 要先检查 `pages_per_tile` 与 CTA 分工的 divisibility。
-- `seqlen_k < 2048` 时 fixed cluster/barrier 开销占比较大，历史只保证正确，不承诺一定更快。
-
-### 7.4 小 trick：page ID 只查一次，在 K/V issue 间用寄存器复用
-
-#### 解决的问题
-
-page64 真实 shape 的 NCU 对比中：
+右下角对齐的 causal attention 中，越靠后的 Q tile 能看到越多 K blocks：
 
 ```text
-Atrex 与 TRT 读取的 DRAM payload 基本相同
-Atrex global-load instructions: 228,720
-TRT global-load instructions:     2,640
+early Q tile  → 少量 K blocks
+late Q tile   → 大量 K blocks
 ```
 
-差距主要是 page-table/address bookkeeping。一个 KV128 tile 含两个 page64：
+varlen batch 又叠加不同 sequence lengths。若按自然顺序执行，轻 tile 先完成，重 tile 留在 grid 尾部，会产生少数长任务拖尾。
+
+### 10.3 LPT 与 CLC 分工
 
 ```text
-K：CTA0/CTA1 各查一个 page ID   → 2 次/cluster
-V：两个 CTA 再查 page0/page1    → 4 次/cluster
-合计                              6 次/cluster/tile
+LPT (Longest Processing Time first)
+    根据 causal K-block count，把重 tile 映射到较早 work ID
+
+CLC (Cluster Launch Control)
+    resident cluster 完成当前 work 后，异步取消一个尚未启动的 cluster，
+    取得其 block/cluster ID，并在当前 resident cluster 上继续执行该 work
 ```
 
-K/V 使用相同 physical page IDs，没有必要重复查询。
+LPT 改善初始排序，CLC 做动态 work stealing。二者缺一不可：LPT 不会处理运行时不均衡，CLC 也不知道哪个 work 更重。
 
-#### 怎么做
+NVIDIA CUDA Programming Guide 说明，CLC 是 Blackwell compute capability 10.0 引入的功能；取消请求是异步操作，通过 shared-memory barrier 返回，成功后 resident block/cluster 使用被取消任务的 index 执行 work。
 
-`4f1d748a` 在 load warp 中一次加载当前 logical tile 的 page ID tuple，并在 K/V TMA issue 间复用：
+来源：[CUDA Programming Guide — Cluster Launch Control](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/cluster-launch-control.html)
+
+### 10.4 当前如何隐藏 CLC 开销
+
+CLC response 为 16 bytes，使用一个 stage 的 async pipeline：
 
 ```text
-page_ids = load_page_table_once()
+leader CTA load warp:
+    issue next-work cancellation/fetch
+    mbarrier.expect_tx(16)
+
+current work:
+    TMA / QK / softmax / PV / correction continues
+
+work boundary:
+    wait response only when advance_to_next_work()
+```
+
+load warp 在发完当前 tile 的 TMA 后预取 CLC response，把 request latency 与当前 work 的 compute overlap。非 leader CTA 不独立请求；整个 physical cluster 必须消费同一个 work ID。
+
+### 10.5 CLC 的正确调度单位是 2CTA cluster
+
+必须同时满足：
+
+```text
+launch cluster shape         = (2,1,1)
+CLC problem cluster shape    = (2,1,1)
+scheduler coordinate divisor = 2 CTA
+```
+
+若 CLC descriptor 错写成 cluster M=1，CTA0/CTA1 可能取得不同 work，随后却共同发 `UTCQMMA.2CTA`，结果是 partial final cluster 错乱或 hang。
+
+causal K bound 也必须使用 logical cluster M=256，而不是 per-CTA M=128；否则 CTA1 的后 128 rows 会缺少本应可见的晚 K blocks。
+
+### 10.6 CLC 与 PackGQA/wave 的关系
+
+- PackGQA 先减少 work clusters 和 padding，可能直接跨过 74-cluster wave cliff；
+- LPT 把 remaining heavy works 提前；
+- CLC 让完成较早的 resident clusters steal 尚未启动的 work；
+- KPP global phase 保证同一个 resident cluster 连续执行多个 work 时 pipeline 仍正确。
+
+三者分别处理 work 数、work 顺序和动态负载均衡，不能互相替代。
+
+### 10.7 CLC KPP 到底是什么
+
+这里的两个缩写处理不同的循环层级：
+
+```text
+CLC: Cluster Launch Control
+     在 work 边界复用 resident physical cluster，动态取得下一个 work ID
+
+KPP: K-direction ping-pong
+     在单个 work 内沿 K-block 方向轮换两个 S/P TMEM slots，
+     overlap QK(i+1) 与 softmax/PV(i)
+
+CLC KPP:
+     physical cluster 连续执行多个 CLC works 时，仍保留 KPP fast path，
+     并让 KPP barrier generation 跨 work 正确延续
+```
+
+CLC 不会在同一个 cluster 内并发执行两个 works。它只是在 work A 结束后，让同一组 CTA 和 warps 继续执行 work B。KPP 才是 work 内部的 K-direction pipeline。
+
+例如 grid 有 80 个 logical works，而第一 wave 最多 resident 74 个 clusters：
+
+```text
+grid work IDs:  W0  W1  W2  ...  W73  W74  W75 ... W79
+
+physical C0:    W0 ───────────────► cancel/fetch W74 ─────► ...
+physical C1:    W1 ───────────► cancel/fetch W75 ─────────► ...
+physical C2:    W2 ────────────────────────────────────────► exit
+                 ^                         ^
+                 |                         |
+          physical cluster 不变       logical work ID 改变
+```
+
+图中 W74/W75 只是示意；硬件返回的是成功取消、尚未启动的 cluster index。关键是 SMEM、TMEM allocation、mbarriers 和各 warp 的 pipeline state 都属于 physical cluster 生命周期，不会因为 work ID 改变而重新构造。
+
+代码结构等价于：
+
+```python
+# physical-cluster lifetime: 只执行一次
+allocate_smem_and_tmem()
+init_mbarriers()
+init_q_kv_s_p_o_pipeline_states()
+kpp_iter_global = 0
+
+work = tile_scheduler.initial_work_tile_info()
+while work.is_valid_tile:
+    run_q_kv_tma(work)
+    run_kpp_qk_softmax_pv_correction(work)
+    # leader CTA 的 load warp 已经异步预取下一个 CLC response
+    work = tile_scheduler.advance_to_next_work()
+
+drain_pipelines_and_free_tmem()
+```
+
+因此“persistent CLC 下维护跨 work-tile 的 pipeline epoch”不是保存 attention 数值；Q、O、row max、row sum 都会为新 work 重新开始。需要保存的是同一批物理 mbarriers 下一次应使用的 slot/phase，以及 Q、KV、S/P/O 各 producer/consumer ring 已推进到哪一代。
+
+### 10.8 为什么 odd K-block work 会破坏 KPP epoch
+
+两个 KPP slots 的映射是：
+
+```text
+global K iter    slot = iter % 2    phase = (iter // 2) & 1
+      0                 0                       0
+      1                 1                       0
+      2                 0                       1
+      3                 1                       1
+      4                 0                       0
+```
+
+`slot` 选择两组 S/P TMEM region 和 mbarrier；`phase` 区分同一 mbarrier 的相邻 generation。假设 work A 有三个 K blocks：
+
+```text
+physical cluster lifetime ─────────────────────────────────────────►
+
+work A
+  K0                K1                K2
+  slot0/phase0       slot1/phase0      slot0/phase1
+                                          |
+                                          | slot1/phase1 尚未闭合
+                                          v
+                                     dummy slot1/phase1
+                                          |
+work B                                    v
+  K0                K1                ...
+  slot0/phase0       slot1/phase0
+```
+
+若 work B 把局部计数强制重置为 `slot0/phase0`，MMA 和 softmax 可能把 work A 的旧 arrival 当成 work B 的新 completion，或者分别等待不同 generation。表现通常是 hang、CUDA 912，或更危险的旧 S/P 数据被误消费。
+
+仅仅让 `global_iter += 3` 也不够理想：下一 work 会从 `slot1/phase1` 开始，所有独立 warp role 都必须无误地继承这个半周期。当前最终方案在 odd work 后补齐另一个 slot，把 work 边界恢复到完整的双-slot周期。
+
+### 10.9 代码层如何闭合 dummy epoch
+
+MMA warp 与 softmax warpgroup 各自维护同构的 `kpp_iter_global`，变量在各自的 persistent work loop 外。work 的真实 K blocks 完成后：
+
+```python
+# MMA side: S producer, P consumer
+kpp_iter_global += block_iter_count
+
+if block_iter_count % 2 != 0:
+    dummy_slot = kpp_iter_global % 2
+
+    # 不发 QK；只生成该 dummy slot 的 S-ready token
+    pipeline_s_full_kpp.producer_commit_w_index(dummy_slot)
+
+    # 等 softmax side 回送 dummy P-ready，再完成 consumer release
+    pipeline_p_full_kpp.consumer_wait(p_state)
+    pipeline_p_full_kpp.consumer_release(p_state)
+    p_state.advance()
+
+    kpp_iter_global += 1
+```
+
+softmax warpgroup 执行互补的一半：
+
+```python
+# softmax side: S consumer, P producer
+if block_iter_count % 2 != 0:
+    dummy_slot  = k_iter % 2
+    dummy_phase = (k_iter // 2) & 1
+    p_phase     = dummy_phase ^ 1
+
+    pipeline_s_full_kpp.consumer_wait_w_index_phase(
+        dummy_slot, dummy_phase
+    )
+    pipeline_p_full_kpp.producer_acquire_w_index_phase(
+        dummy_slot, p_phase
+    )
+
+    cute.arch.sync_warp()
+    with cute.arch.elect_one():
+        pipeline_p_full_kpp.producer_commit_w_index(dummy_slot)
+        pipeline_p_full_lastsplit_kpp.producer_commit_w_index(dummy_slot)
+
+    k_iter += 1
+
+kpp_iter_global = k_iter
+```
+
+这个 dummy iteration：
+
+- 不发 QK UMMA；
+- 不读 S、不算 softmax、不写真实 P；
+- 不发 PV UMMA，也不修改 O；
+- 只让 S producer→consumer 与 P producer→consumer 的 barrier generation 成对闭合。
+
+Q TMA phase、5-stage KV producer/consumer state、`O_full/O_rescaled` phase 也都在各 warp role 的 work loop 外持续推进；它们不能因为 `work_tile.tile_idx` 更新就归零。不同 pipeline 可以有不同 ring size 和 phase，但必须遵守同一原则：**复用 physical storage，就必须继承该 storage 的下一合法 generation。**
+
+优化和验证顺序应固定为：
+
+1. CLC descriptor、launch cluster shape 和 scheduler divisor 都使用 `(2,1,1)`。
+2. CLC response 只由 leader CTA 请求，并在所有 warp roles 的 work 边界一致消费。
+3. S、P、O 使用独立 barrier contract；不要用一个 phase 猜另一个 pipeline 的 generation。
+4. slot/phase 来自跨 work 的 global counter。
+5. odd K-block work 执行 dummy S/P closure。
+6. load warp 提前发 16-byte CLC async request，让返回延迟与当前 work compute overlap。
+7. 同时覆盖 PackGQA、odd/even K-block、连续多次 steal 和 partial-final-cluster 测试。
+
+## 11. Paged-KV 寻址：减少 payload 之外的 load 指令
+
+### 11.1 page、tile、physical page 是三个单位
+
+```text
+n_block        logical KV128 tile 编号
+logical page   page_table 列编号
+physical page  page_table 中保存的实际页号
+```
+
+任何优化都必须先把三者分开。page256 是“一页多 tile”，page16/32/64 是“一 tile 多页”；两类映射不能共用同一个简化公式。
+
+### 11.2 K/V page ID register cache
+
+page64 的一个 KV128 tile 有两个 physical page IDs。优化前：
+
+```text
+K: CTA0 查 page0，CTA1 查 page1               = 2 loads / cluster
+V: CTA0 查 page0/page1，CTA1 查 page0/page1   = 4 loads / cluster
+合计                                           = 6 loads / cluster / KV tile
+```
+
+K 与 V 使用相同 physical page IDs。当前先在 load-warp registers 中构造 compile-time tuple，再复用于 K/V TMA：
+
+```text
+page_ids = load_page_table_once(n_block)
     ├─ issue K TMA(page_ids)
     └─ issue V TMA(page_ids)
 ```
 
-#### 收益
+page64 从 6 次降到 4 次 page-table loads；实测 kernel global-load instructions 下降约 32.8%。
 
-global loads 约下降 32.8%，与理论从 6 次降到 4 次接近；最差真实 shape 被推进“不慢于 TRT 5%”的验收范围。
+关键点：
 
-#### 关键技巧
+- cache page IDs，而不是完整 K/V address；K/V source-tile 公式不同；
+- tuple 长度由 page size 在编译期决定：page16/32/64 分别为 8/4/2；
+- register-local reuse 不需要新增 cluster SMEM/barrier；
+- 指令数下降必须同时带来 wall-time 改善，否则不值得增加 live registers。
 
-- tuple 长度由 page size 决定，必须 compile-time specialization。
-- register-local 复用优于为了共享索引新增 cluster shared-memory 同步。
-- K/V 的 page ID 相同，但 source layout 和 CTA 分工不同；缓存索引，不要勉强缓存完整 address 计算结果。
-- 指令下降不等于 latency 一定下降；必须同时看 wall time，否则回退。
+### 11.3 masked tail 的物理 load 仍必须安全
 
-### 7.5 小 trick：masked tail 必须指向“有限的有效页”
-
-#### 解决的问题
-
-最后一个 logical tile/page 常常不完整，但 TMA 或 CTA-local copy 仍可能对被 mask 的列发物理 load。当前 HEAD 的无效 entry 仍可能使用：
+TMA 或 CTA-local async copy 可能对最终 partial tile 的 masked columns 继续发物理 load。若 invalid page entry 指向 physical page0，而 page0 未初始化或含 FP8 NaN：
 
 ```text
-physical_page = 0
+masked tail load NaN
+    → FP8 MMA accumulator
+    → score mask 未必能消除 NaN 污染
 ```
 
-page 0 未必初始化，也可能包含 FP8 NaN：
+正确做法是让 invalid tail 指向该 sequence 最后一个已初始化、有限的 physical page，然后再由 causal/seqlen mask 丢弃越界 columns。
+
+截至 `0381108a`，safe-tail 修复仍只在 `0d56d09f` / `8bbeb01d` side branches；主线部分路径仍返回 page0。这是当前 kernel 的 P0 correctness risk。
+
+必须用下面的 adversarial case 验证：
+
+- physical page0 主动填 FP8 NaN；
+- 有效 sequence 不引用 page0；
+- shuffled page table；
+- `seqlen_k = page_size±1, tile_n±1`；
+- page64 CTA1-only partial half；
+- page16/32/64/128/256。
+
+## 12. FP8 数值路径也是 pipeline 设计
+
+### 12.1 为什么 P 需要放大后再 cast FP8
+
+softmax probability P 直接 cast E4M3 容易让小概率下溢。kernel 在写 P TMEM 前放大：
 
 ```text
-masked tail → load page0 NaN → MMA accumulator → 后续 score mask 无法可靠消除
+P_fp8 = cast_e4m3(P_fp32 × 2^max_offset)
 ```
 
-page64/tile128 下，CTA1 的 local predicate 还可能漏掉自身 64-token offset，使 partial half 继续发 load。
-
-#### 怎么做
-
-side-branch `0d56d09f` / `8bbeb01d` 的做法是：
+PV/O 最终再补偿该 scale。当前：
 
 ```text
-invalid tail entry
-    → 指向该 sequence 最后一个有效 physical page
-    → 再由 seqlen/causal score mask 丢弃越界列
+max_offset         = 4
+rescale_threshold  = 4
 ```
 
-最后有效页至少属于当前请求且已初始化，避免引入 NaN 源。
-
-#### 关键技巧
-
-- “数学上会被 mask”不代表物理 load 可以读取任意垃圾；masked load 也必须数值安全。
-- page0=NaN 是必要的主动回归，不要依赖 allocator 恰好清零。
-- 同时覆盖 small-page TMA 和 PagedKVManager 路径，以及 CTA1-only partial half。
-- `seqlen_k=0` 若不支持，应提前 assert；不能直接计算 last valid page。
-
-#### 当前状态：P0 风险
-
-截至 `0381108a`，safe-tail fix 仍在 side branch，尚未进入当前主线；当前 `load_paged_tma_page_indices()` 和部分 PagedKVManager fallback 仍会为 invalid entry 返回 0。除非上层严格保证 physical page 0 始终初始化为有限值，否则这是需要优先合入或重新实现的正确性风险。
-
-## 8. 大优化点五：FP8 数值路径与服务热路径
-
-前四组优化主要处理 GPU kernel 内部。最后一组保证 FP8 cast 不损失有效动态范围，并把不会随请求变化的 Python/JIT 工作移出服务热路径。
-
-### 8.1 小 trick：P scaling 与 online-softmax correction 联合设计
-
-#### 解决的问题
-
-softmax 概率 P 写入 FP8 E4M3 前容易下溢，因此 kernel 在 cast 前乘 `2^max_offset`，PV 后再反缩放。但 online softmax 的 running row max 可能落后真实 max；放大过多会让 P 超过 E4M3 最大有限值 448 并 saturation。
-
-可以近似写成约束：
+online softmax 的 running max 最多允许落后 4 个 log2 units，而 P 又放大 4 bits。近似保持：
 
 ```text
 max_offset + rescale_threshold <= 8
 ```
 
-其中：
+避免放大后的 P 超过 E4M3 最大有限范围，同时减少 underflow。
 
-- `max_offset`：P cast 前主动放大的 log2 指数；
-- `rescale_threshold`：running max 允许落后的 log2 阈值。
+### 12.2 P 与 O 必须使用同一个 offset
 
-#### 怎么做
+P cast 前使用 `2^4=16`，最终 normalization 必须用相同 `max_offset` 修正 row sum/LSE/O scale。只改 P 路径或只改 epilogue 会产生整体 scale error，而不一定产生 NaN。
 
-当前 FP8 配置为：
+因此正确性不能只检查 finite，还要看 cosine、relative L1/L2 和输出幅值。
 
-```text
-max_offset = 4
-rescale_threshold = 4
-```
+### 12.3 数值 knob 会改变同步频率
 
-P producer 和最终 O normalization 都使用同一个 offset。correction warp 在 running max 跳变时重缩放已有 O accumulator。
+`rescale_threshold` 决定 running max 变化多大时触发 correction。它同时影响：
 
-#### 关键技巧
+- correction warps 执行多少次 TMEM load/mul/store；
+- MMA warp 等待 `O_rescaled` 的频率；
+- `O_full`/softmax-stats barrier 压力；
+- P saturation 与 underflow。
 
-- 数值 knob 同时是同步 knob：threshold 会改变 correction 频率和 O-full barrier 行为。
-- P cast 与 O normalization 必须使用同一个 offset；只改一处会产生整体 scale 错误。
-- saturation 不一定产生 NaN，必须看 cosine、relative L1/L2，而不只是 finite。
-- 减小 offset 防 saturation，却可能增加小概率下溢；两端都要测。
-- TRTLLM 某些 FP8-output baseline 在模型尺度输入上会接近全零，只能作为 speed lower bound，不能当 correctness golden。
+曾尝试 `(max_offset, threshold)=(2,6)` 并 conditional wait，希望减少 correction；实测改善只有 `0.01%–0.13%`。原因是 `should_rescale` 为 warp-wide ballot，32 行中任意一行命中就让整个 warp 执行，实际几乎每轮为真。
 
-### 8.2 小 trick：优化条件分支前，先测 warp-wide predicate 命中率
+结论：调数值阈值前必须统计 warp-wide predicate 命中率，不能仅根据标量概率判断同步会减少。
 
-#### 实验
+### 12.4 B300 native EX2
 
-曾尝试把 `(max_offset, threshold)` 从 `(4,4)` 改成 `(2,6)`，并仅在 `should_rescale=True` 时等待 O-full barrier，希望减少 correction 同步。
+SM103 路径把 `ex2_emu_freq=0`，softmax exponent 使用硬件 `MUFU.EX2`，不再像部分早期 Blackwell 配置那样混入 software exp2 emulation。最终 reciprocal 使用 `MUFU.RCP`/approx reciprocal。
 
-#### 为什么没有收益
-
-`should_rescale` 是 warp-wide predicate：32 行中只要一行需要 rescale，整个 warp 就执行 correction。实测它几乎每轮都为真，最终改善只有约 `0.01%–0.13%`，属于噪声范围，方案回退。
-
-#### 可复用技巧
-
-看到源码里有 `if`，不代表大多数迭代能跳过。任何 conditional-wait、conditional-correction 优化，都应先统计真实 predicate 分布和 warp aggregation 行为。
-
-### 8.3 小 trick：prepare 固化静态 dispatch，run 只做 launch
-
-#### 解决的问题
-
-普通 Python wrapper 每次调用可能重复：
-
-- shape/dtype/layout validation；
-- causal/window 参数归一；
-- kernel variant 选择；
-- compile-key 组装与 cache lookup；
-- fake tensor / JIT compile 检查；
-- 输出和 aux metadata 准备。
-
-短 kernel 中，这些 CPU 工作会污染端到端延迟，也不利于 CUDA Graph capture。
-
-#### 怎么做
-
-`1eab0af9` 增加 `FlashAttentionHd256Prefill`：
+SASS 验证应看到：
 
 ```text
-prepare()/plan():
-    validation
-    static dispatch
-    compile/cache lookup
-    固化 callable 与静态参数结构
-
-run():
-    接收本次 Q/K/V、长度 tensor、page table、out
-    直接启动 prepared kernel
-    不读取 device sequence lengths
+MUFU.EX2
+MUFU.RCP
+UTCQMMA.2CTA
 ```
 
-#### 关键技巧
+而不是用大量额外 ALU 序列模拟 exponent。
 
-- prepare 只能固化 dtype、layout、page size、head 数、PackGQA 等静态属性。
-- `cu_seqlens`、`seqused_k`、page-table 内容是动态数据，必须继续由 device tensor 提供。
-- dtype/layout/page size/head 数变化时必须重新 prepare。
-- compile key 必须覆盖所有影响 descriptor/layout 的属性；当前包含 Q dtype、KV dtype、head dim、HKV、page size、PackGQA、2CTA 等。
-- benchmark 要明确是否计入 prepare/compile。kernel 对比通常排除，服务冷启动则单独报告。
+PTX 指令语义参考：[PTX ISA — ex2](https://docs.nvidia.com/cuda/parallel-thread-execution/#floating-point-instructions-ex2)
 
-### 8.4 小 trick：CUDA Graph 下替换 runtime metadata tensor，而不重做 dispatch
+## 13. 有效优化与性能证据
 
-#### 解决的问题
+不同报告的 shape、page size 和 baseline 不同，下面只记录能由 counter/SASS 解释的 kernel feature。
 
-vLLM 会复用 graph-stable metadata buffer，但每个 scheduler step 的内容不同。若 `run()` 固定使用 prepare 时的长度 tensor，或者根据新长度重新选择 CUBIN，都无法正确支持 graph replay。
-
-#### 怎么做
-
-`0381108a` 允许 `run()` 覆盖：
-
-- `cu_seqlens_q/k`；
-- `seqused_q/k`；
-- `page_table`；
-- output buffer。
-
-静态 kernel 选择不变，runtime 只替换 tensor 指针/内容；page128 vLLM path 因而可以 graph-safe replay。
-
-#### 关键技巧
-
-- graph safety 的关键不是“所有参数不变”，而是 kernel topology 不依赖动态 sequence length。
-- prepared callable 与 graph 生命周期中的 buffer 地址约束必须一致。
-- 不要在 `run()` 中基于长度选择 1CTA/2CTA 或重新组 compile key。
-
-### 8.5 小 trick：把调优开关留在实验层，不让环境变量决定产品行为
-
-#### 解决的问题
-
-早期存在 `FA_CLC`、`FA_HD256_2CTA`、`FA_HD256_USE_MAIN` 等环境开关。它们适合 A/B，但会让相同 wheel 在不同 shell 中运行不同 kernel，并扩大 compile/test 矩阵。
-
-#### 怎么做
-
-`68c6014e` 固定目标路径为 CLC，配合 2CTA-only 收敛，删除 static fallback 与产品环境开关。
-
-#### 关键技巧
-
-- A/B knob 保留在独立 benchmark、workspace kernel 或实验 branch。
-- 产品源码只留下已经通过完整 correctness/performance matrix 的配置。
-- profiler 首先确认 kernel class、block size 和 cluster size，避免测试脚本仍设置无效的旧环境变量。
-
-## 9. 优化之间的依赖关系：单点有效不等于组合有效
-
-这条 kernel 的多数问题发生在优化组合处。下面的依赖比单个 knob 更值得长期保留。
-
-| 组合 | 必须满足的条件 | 失败表现 |
+| Kernel feature | 代表收益 | 机制证据 |
 | --- | --- | --- |
-| 2CTA + causal | causal bound 使用 logical cluster M=256 | CTA1 后半 rows 缺 K blocks |
-| 2CTA + CLC | physical cluster、CLC descriptor、coordinate divisor 一致 | partial cluster 错乱或 hang |
-| CLC + KPP | slot/phase 跨 work 保留；odd work 补 dummy epoch | CUDA 912、hang、随机误差 |
-| PackGQA + KPP | fast-path predicate 不排除 PackGQA | work 变少但 kernel 反而慢 |
-| small-page TMA + 2CTA | K/V 各自按正确维度拆分；本地 barrier bytes 正确 | 读错页或 barrier deadlock |
-| page-index cache + tail | invalid tuple entry 仍指向有限页 | page0 NaN 污染 |
-| P scaling + correction | P 与 O 使用相同 offset；threshold 满足 FP8 范围 | 静默 saturation/scale error |
-| prepare + CUDA Graph | 只固化静态属性；动态长度留在 tensor | replay 错误或触发重新 dispatch |
-| sQ/sO alias + persistent | 必须重新证明全体 warp 生命周期不重叠 | 覆盖仍在使用的 Q 数据 |
+| CLC + LPT + warp-role registers | 8K `514.85→463.62 us` | 降低 causal tail；最终 role allocation 的 local/shared spill 为 0 |
+| page128/256 TMA | 32K prefix `3200→2980 us` | LSU traffic `168.9M→13.0M`；tensor pipe `67.7%→76.3%` |
+| K/V stage 4→5 | `0.8%–2.4%` | tensor active/eligible warps 上升，barrier stall 下降，occupancy 不变 |
+| page16/32/64 TMA | FP8 60/60 快于当时 nightly TRTLLM-gen，`1.090x–1.338x` | `LDGSTS→0`，出现 page-sized `UTMALDG.4D` |
+| PackGQA + KPP | 真实 shape 避免 wave cliff | work 80→68 clusters；仍进入 KPP fast path |
+| K/V page-ID cache | global-load instructions 约 `-32.8%` | K/V 复用 register page-ID tuple |
 
-一个实用检查法是：每增加一个优化，先列出它改变了哪些状态边界——work geometry、layout、barrier epoch、shared-memory lifetime、compile key 或 runtime metadata——然后逐项检查与已有 fast path 的交集。
+### 13.1 最终 small-page SASS 检查点
 
-## 10. 没有形成产品收益的实验
-
-失败实验不是独立的大优化点，而是每个大方向的边界条件。保留它们可以避免重复验证相同的错误假设。
-
-| 所属方向 | 实验 | 预期 | 实测与结论 |
-| --- | --- | --- | --- |
-| varlen | single-seq route-to-dense | 绕过 varlen 固定开销 | 短期有效，只用于定位 ceiling；最终删除 |
-| topology | 仅按 64K 阈值选择 2CTA | 用简单规则覆盖长序列 | batch/prefix/heads 改变结论，误判较多 |
-| topology | 复杂 shape policy | 每个 shape 选 1CTA/2CTA 最优 | 规则快速膨胀、容易过拟合；产品固定 2CTA |
-| pipeline | KV stage 3 | 降低 shared memory/barrier | 2K/16K/64K 退化约 8%/26%/24% |
-| pipeline | KV stage 6 | 更深预取 | B=1 基本无收益，B=4 略慢于 stage 5 |
-| pipeline | split-P 75%→50% | PV 更早开始 | `-0.3%～+0.1%`，基本中性 |
-| pipeline | split-P 25% | 更激进 overlap | SM launch failure，说明同步组合可能非法 |
-| pipeline | CLC 直接复用 static KPP | 保留 overlap | odd K-block 后 phase 错，必须维护 global epoch |
-| work geometry | 只打开 PackGQA | 减少 cluster 数 | 因 predicate 关闭 KPP，某些 shape 反而退化 |
-| FP8 | threshold 4→6/8 | 减少 correction | warp-wide predicate 抵消收益，boundary case 无改善 |
-| FP8 | conditional O-full wait | 无 rescale 时跳过等待 | 仅 `0.01%–0.13%`，回退 |
-| Paged-KV | invalid tail 指向 page0 | 简化边界逻辑 | 可能读取未初始化 FP8 NaN，不安全 |
-| shared memory | 把 1CTA sQ/sO alias 直接移到 2CTA | 释放空间 | CLC/persistent 生命周期无法证明，当前明确禁用 |
-
-这些实验反映出几个通用规律：
-
-- 先测 predicate/occupancy/work geometry，再改源码；
-- “更多 stage”“更早 arrival”“更少 work”都不是单调收益；
-- correctness isolation 优先于保留全部 fast path；
-- 产品配置追求可验证的整体矩阵，不追求每个 shape 的 oracle dispatch。
-
-## 11. 性能证据应如何理解
-
-不同报告的 baseline、page size、PackGQA、timer 和 GPU clock 不完全一致，不能把所有数字拼成一条单调优化曲线。下面只按证据类型归纳。
-
-### 11.1 单项优化证据
-
-| 优化 | 代表结果 | 说明 |
-| --- | --- | --- |
-| ragged O TMA | 4×4096 `303.97→267.36 us`，约 `-12%` | 原型 varlen epilogue；当前产品未使用 |
-| varlen CLC+LPT + reg topology | 8K `514.85→463.62 us` | native varlen 接近 dense ceiling |
-| page128/256 TMA | 32K prefix `3200→2980 us`；LSU 约降 13 倍 | 消除 gather/address bottleneck |
-| 1CTA sQ/sO alias + stage5 | 三个 prefix case 改善约 `5.2%/3.2%/1.0%` | 历史 1CTA 路径 |
-| 2CTA KV stage5 | 代表 shapes 改善 `0.8%–2.4%` | 当前产品路径 |
-| 2CTA vs 1CTA，30% prefix | 22 cases 提升约 `1.037x–1.083x` | 说明目标 workload 中 2CTA 有整体收益 |
-| page-ID cache | global load 约降 32.8% | 把最差真实 shape 推入 5% gate |
-
-### 11.2 最终矩阵证据
-
-- small-page FP8：page16/32/64 共 60 cases，60/60 finite、correct，并快于当时 nightly TRTLLM-gen，speedup `1.090x–1.338x`。
-- page64 真实 19 shapes：19/19 进入 Atrex 不慢于 TRT 5% 的门槛，13/19 严格更快，几何平均 speedup `1.087x`。
-- page128 历史 103 shapes：相对当时 custom FA4，103/103 更快，几何平均 speedup `1.389x`。
-- `0381108a` 对 flash-attn-4 dev1503 的 page128 扩展测试：68/68 更快，报告的几何平均 speedup `1.375x`；NCU 显示主要来自更高 SM throughput，而不是 DRAM 饱和。
-
-### 11.3 为什么不同新 wheel 对比会得到不同幅度
-
-2026-07-24 的记录同时包含两类口径：
-
-- 默认/production-facing prepared 或 graph 路径、PackGQA 生效时，对 dev1503 的扩展 page128 corpus 报告约 `1.375x` geomean；
-- 双方都改成 direct public forward、`pack_gqa=False`、锁 2032MHz 后，对 dev1494 的 Qwen3.5 12 shapes 为 `1.069x`，Qwen3.7 34 shapes 的 do_bench/Graph 分别约 `1.038x/1.063x`。
-
-这不是矛盾，而是说明 host path、PackGQA、wheel 版本、shape corpus 和 timer 会显著改变结果。引用性能时必须同时写清这些条件，不能只保留一个 speedup 数字。
-
-### 11.4 当前仍有改进空间的区域
-
-page64 short-Q / very-long-K / sub-wave shapes 中，2CTA correction barrier 仍是残余瓶颈。最差 case 的 SourceCounters 把多数 barrier samples 定位到 intermediate O-full wait；Atrex 与 TRT 读取的 DRAM payload 相近，因此继续减少 payload 不是第一优先级。更可信的后续方向是：
-
-- 在不破坏统一 topology 的前提下降低 correction/cluster 同步成本；
-- 改善 page/address locality；
-- 用可解释的 work-geometry 指标判断是否值得重新引入有限 dispatch；
-- 优先合入 safe-tail correctness fix，再做新的性能叠加。
-
-## 12. 验证方法：按优化影响的层次设计 case
-
-### 12.1 基础数值门槛
-
-FP8 attention 不宜只用默认逐元素 `assert_close`。历史常用门槛为：
+代表性 FP8 page16、HQ32/HKV2、K4096 报告：
 
 ```text
-finite output
-cosine > 0.99（稳定产品结果通常 > 0.999）
-relative L1 < 0.08
-relative L2 <= 0.05
-max abs 作为辅助指标
+block / cluster       320 threads / cluster X=2
+dynamic SMEM          182.27 KB / CTA
+registers             160 / thread（NCU allocation）
+UTCQMMA.2CTA           40 static instruction sites
+UTMALDG.3D.2CTA        2  static sites（Q）
+UTMALDG.4D             32 static sites（paged K/V）
+LDGSTS                  0
+local/shared spill      0 / 0
 ```
 
-同一实现的 contiguous/paged 路径若运算顺序等价，可要求 bit-exact；与独立 baseline 比较则使用统计阈值。
+静态 instruction-site 数不等于每个 work 的动态执行次数；它用于确认 specialization 生成了预期指令类别。
 
-### 12.2 native varlen 必测
+### 13.2 当前残余瓶颈
 
-- batch=1、batch=4 equal、batch=4 irregular、long-tail；
-- segment start 非 8/16/128 对齐，例如 `[100,127,300,4097]`；
-- tiny tail：`1/127/128/129`；
-- `cu_seqlens` 和 `seqused` 两类 metadata；
-- max sequence length 大于真实长度；
-- empty Q/K 若不支持，应验证明确 assert。
+page64 的 short-Q / very-long-K / sub-wave shapes 中：
 
-### 12.3 2CTA / CLC / causal 必测
+- K/V DRAM payload 与 TRT baseline 基本相同；
+- Atrex barrier stall 更高；
+- SourceCounters 把主要 stall 定位到 intermediate O-full wait；
+- long-scoreboard 不是最主要差距。
 
-- Q rows 同时覆盖 CTA0 和 CTA1；
-- Q length 为 `128±1`、`256±1` 和 partial final cluster；
-- K-block 数分别为奇数和偶数；
-- 同一个 persistent cluster 连续获取多个 CLC work；
-- equal Q/K；
-- Q<K 的 prefix-cache 右下角 causal 对齐；
-- very-short-Q + very-long-K；
-- PackGQA 的 HQ16/HKV1 与 HQ32/HKV2。
+这说明下一步不应继续盲目减少 K/V payload，而应优先研究 correction/O-rescaled 同步、short-Q 下的 cluster occupancy，以及是否存在不破坏统一 2CTA topology 的调度办法。
 
-### 12.4 Paged-KV 必测
+## 14. 修改 kernel 时的验证矩阵
+
+### 14.1 2CTA / causal / PackGQA
+
+- Q length：`128±1`、`256±1`、1084、1408；
+- HQ16/HKV1 与 HQ32/HKV2；
+- PackGQA 前后 work clusters、physical CTAs、waves；
+- CTA0/CTA1 rows 分别比较；
+- partial final cluster；
+- Q<K 的 prefix-cache causal 对齐。
+
+### 14.2 KPP / persistent phase
+
+- odd/even K-block count；
+- 同一 resident cluster 连续取得多个 CLC works；
+- causal-mask loop、no-mask loop、最后一次 iteration；
+- P partial/full arrival；
+- O correction 发生/不发生；
+- work A 为 odd blocks，work B 紧随其后。
+
+### 14.3 TMA / Paged-KV
 
 - page16/32/64/128/256；
-- identity 和 shuffled page table；
-- physical page0 主动填 FP8 NaN，且有效 sequence 不引用 page0；
-- `seqlen_k` 位于 `page_size±1`、`tile_n±1`；
+- identity 与 shuffled page table；
 - page256 的第二个 tile；
-- page16/32/64 的一个 tile 聚合多页；
-- CTA1-only partial half；
-- contiguous 与 paged 输出对比；
-- 多次运行检查非确定性。
+- page16 一 tile 八页；
+- physical page0=NaN；
+- partial page/tile；
+- NCU/SASS 确认 `UTMALDG`、`LDGSTS`、TMA bytes 与 barrier stall。
 
-### 12.5 Pipeline 必测
+### 14.4 Epilogue
 
-- causal-mask loop、no-mask loop 和最后一次 iteration；
-- split-P partial/full arrival；
-- correction rescale 发生与不发生；
-- odd K-block work 后紧跟另一个 CLC work；
-- PackGQA + KPP 的组合路径；
-- 清理 JIT cache 后重新编译；
-- SASS 确认没有意外 `LDL/STL` spill。
+- PackGQA row/head 映射；
+- ragged sequence start 非 8/16/128 对齐；
+- final partial M tile；
+- `LDS.128/STG.E.128` coalescing；
+- TMEM/SMEM async fence 与 named barrier；
+- 若实验 TMA O，必须验证 `UTMASTG`、ragged descriptor base 和 sO reuse wait。
 
-## 13. 性能测量与 NCU 诊断顺序
-
-### 13.1 分开三种时间
+### 14.5 FP8 数值
 
 ```text
-compile time  CuTe DSL/JIT 生成 CUBIN
-prepare time  validation、dispatch、cache lookup、callable 准备
-run time      kernel launch 与 GPU execution
+finite
+cosine > 0.99
+relative L1 < 0.08
+relative L2 <= 0.05
 ```
 
-kernel 优化比较排除 compile/prepare；服务冷启动则三项分别报告。
+额外覆盖：P underflow、E4M3 saturation、rescale frequent/rare、contiguous vs paged、不同模型幅值。
 
-### 13.2 do_bench、CUDA Graph 和 NCU 各自回答不同问题
+## 15. NCU/SASS 诊断顺序
+
+### 15.1 先确认 kernel identity
 
 ```text
-do_bench
-    快速 sweep、发现候选和异常 shape
-
-CUDA Graph replay
-    服务态 launch 路径与 graph-safe 行为
-
-NCU gpu__time_duration.sum
-    kernel duration、identity、stall、pipe、cache、指令和 launch geometry
+kernel             FlashAttentionForwardHd256_2CTA_Sm103
+SM                 103
+block              320
+cluster            (2,1,1)
+dynamic SMEM       ≈182 KB
+input/output       FP8 / BF16
 ```
 
-最终结论至少记录：kernel name、grid、threads/block、cluster dimension、dynamic shared memory、registers/thread、capture 次数、中位数、GPU 和频率状态。
-
-### 13.3 第一步：确认测到目标 kernel
+### 15.2 再看 work geometry
 
 ```text
-kernel class = FlashAttentionForwardHd256_2CTA_Sm103
-cluster X    = 2
-block        = 320 threads
-SM arch      = 103
-input        = FP8 E4M3
-output       = BF16
+work clusters
+physical CTAs = clusters × 2
+wave occupancy = clusters / 74
+PackGQA padding
+partial final wave
 ```
 
-identity 不匹配时，后续 counter 没有解释价值。
+如果 work 从 75 降到 74，wave cliff 通常比少几条指令更重要。
 
-### 13.4 第二步：先看 work geometry
+### 15.3 再判断瓶颈
 
-```text
-physical CTAs
-clusters = CTAs / 2
-waves ≈ clusters / 74
-PackGQA 前后 cluster 数
-Q-tail padding
-```
-
-如果恰好从 75 个 cluster 降到 74，优先解释 wave cliff；不要先归因于某条低级指令。
-
-### 13.5 第三步：用 stall/pipe 判断瓶颈类型
-
-| NCU 症状 | 常见原因 | 优先检查 |
-| --- | --- | --- |
-| long scoreboard 高、DRAM SOL 低 | 小 load、地址依赖、预取不足 | Paged TMA、stage、page-ID cache |
-| barrier 高 | 2CTA/KPP/correction 同步 | phase、arrival、O-full wait |
-| local ld/st 非零 | 某类 warp 寄存器不足 | warp-role register config |
-| tensor active 低、grid 不满一波 | 并行度不足 | PackGQA、tile padding、topology |
-| payload 相同但 global loads 多 | page-table/address bookkeeping | index cache、divmod、load warp |
-| DRAM SOL 高 | 真正带宽受限 | 减少 payload、增加 K/V 复用 |
-
-### 13.6 第四步：用 SASS/SourceCounters 证明改动真的生效
-
-历史上的有效信号：
-
-- `STG.E → UTMASTG`：ragged O TMA 生效；
-- `LDGSTS → UTMALDG.4D`：small-page TMA 生效；
-- `UTCQMMA.2CTA`：2CTA UMMA 未被意外移除；
-- `LDL/STL`：寄存器 spill；
-- barrier samples 聚集到 O-full trywait：correction 同步瓶颈；
-- page-table global loads 远多于 payload：重复索引而非 HBM payload 问题。
-
-### 13.7 baseline 对齐清单
-
-至少对齐：
-
-```text
-Q/K/V dtype 与 output dtype
-causal 语义和 Q/K 真实长度
-page size、layout、page compaction 是否在计时内
-GQA ratio 与绝对 head 数
-PackGQA on/off
-prefix-cache hit ratio
-num_splits
-prepare/plan/compile 是否在 timed region
-GPU、频率、timer 与统计方式
-```
-
-短 kernel 必须先 warm up；before/after 使用同一物理 GPU。历史 GPU0 未及时升频的异常表明，显示相同设备型号并不足以保证可比性。
-
-## 14. 推荐的优化工作流
-
-### 14.1 先建立最小解释模型
-
-每轮只回答一个问题：
-
-```text
-瓶颈在哪一层？
-    work geometry
-    compute pipeline
-    data movement/addressing
-    numerical correction
-    host launch
-```
-
-不要同时修改 scheduler、page layout 和 barrier；否则即使变快，也无法知道哪项生效，正确性出错时也无法隔离。
-
-### 14.2 候选优化的最小闭环
-
-```text
-1. 用 NCU/SASS 提出可证伪的瓶颈假设
-2. 只改一个主要机制
-3. 跑最小 adversarial correctness cases
-4. 清 JIT cache，确认 kernel identity
-5. 快速 sweep 看收益覆盖面
-6. 对边界/最差 shape 做 paired NCU
-7. 检查组合 fast path 是否仍启用
-8. 通过完整矩阵后再删除旧 fallback
-```
-
-### 14.3 提交说明至少回答四组问题
-
-#### 正确性
-
-- 改变了哪些支持组合或 invariant？
-- 是否覆盖 ragged、partial cluster、odd K-block、shuffled page 和 page0=NaN？
-- contiguous/paged 是否一致，最差误差是多少？
-
-#### 性能
-
-- baseline、timer、GPU/clock 和 timed region 是什么？
-- 提升覆盖多少 shape，最差退化多少？
-- grid/cluster/wave 如何变化？
-- counter 是否支持瓶颈解释？
-
-#### 可部署性
-
-- clean wheel / clean cwd / empty `PYTHONPATH` 是否通过？
-- 实际 import path 与依赖版本是什么？
-- 是否新增 compile-key 维度？
-- prepared/CUDA Graph 路径是否仍有效？
-
-#### 可维护性
-
-- 能否删除旧 fallback，而不是永久保留双路径？
-- cluster/tile/phase invariant 是否有 assert？
-- 注释是否解释“为什么”，尤其是 dummy handshake 和页/tile 换算？
-- benchmark shape catalog 与环境是否可追踪？
-
-## 15. 当前风险与后续优先级
-
-### P0：safe tail-page fix
-
-当前 HEAD 对 invalid Paged-KV tail 仍可能使用 physical page0。优先工作：
-
-1. 把 `0d56d09f` / `8bbeb01d` 的思路适配到当前 HEAD；
-2. small-page TMA 与 PagedKVManager 两条路径都覆盖；
-3. 增加 page0=NaN、CTA1 partial-half、shuffled page-table 回归；
-4. 明确 `seqlen_k=0` 的支持边界；
-5. 再跑 page16/32/64/128/256 全矩阵。
-
-### P1：版本化性能资产
-
-大量关键证据仍位于本地 `output/` 和独立优化目录。建议版本化：
-
-- shape catalog；
-- benchmark 命令和 timer；
-- commit/wheel/dependency/GPU 版本；
-- 汇总 CSV/Markdown；
-- 大型 `.ncu-rep` 可不进 Git，但保存生成命令和摘要 counter。
-
-### P1：固化依赖组合
-
-提供明确的 CUTLASS DSL / Quack / FA4 wheel 安装入口或 lockfile。依赖不兼容时应输出可诊断错误，而不是静默让 `has_fa4_hd256=False`。
-
-### P2：继续观察真实服务 shape
-
-重点监控：
-
-- prefix-cache 命中率和 Q/K 比；
-- short-Q/very-long-K/sub-wave 分布；
-- page allocator 是否保证所有已引用页有限；
-- CUDA Graph replay 的 metadata buffer 更新；
-- cold compile、prepare 和 warm run 的独立延迟。
-
-## 16. 演进索引：只用于定位代码
-
-### 16.1 原型线 `mudi_dev_fp8_hd256`
-
-| 提交 | 作用 |
+| 症状 | 优先检查 |
 | --- | --- |
-| `5a292fab` | 初始 Blackwell FP8 HD256 attention |
-| `dbb8fe45` | single-seq varlen 临时 route-to-dense |
-| `487d3f3e` | ragged O TMA-store |
-| `06a506be` | vendor/patch，删除本地源码注入 |
-| `6911ed40` | 删除 dense 绕路，native varlen-only |
-| `45d1161b` | varlen CLC+LPT 与寄存器拓扑 |
-| `13393859` | 自包含 correctness/performance benchmark |
+| long scoreboard 高、DRAM SOL 低 | TMA page size、page-table loads、KV stages |
+| barrier 高 | O_full/O_rescaled、KPP phase、2CTA arrival count |
+| tensor active 低 | QK/PV bubble、softmax latency、work/wave 不足 |
+| local load/store 非零 | warp-role register allocation |
+| payload 相同但 global loads 多 | page-ID/address bookkeeping |
+| DRAM SOL 高 | K/V payload、PackGQA/L2 reuse |
 
-### 16.2 产品线 `fa4_mudi`
-
-| 提交 | 作用 |
-| --- | --- |
-| `80774d20` | 最小化 vendored HD256 1CTA kernel |
-| `fe0a5c5c` | page128/256 multi-tile-per-page TMA |
-| `083776d8` | 历史 1CTA sQ/sO alias、KV stage5 |
-| `8d8a4d38` | FP8 split-P 调优 |
-| `1a10ace9` | 2CTA causal logical tile 修复 |
-| `0a60e703` | 历史 1CTA/2CTA shape dispatch |
-| `8afe6eb6` | 专用 SM103 2CTA CLC+LPT kernel |
-| `45e9bda1` | 2CTA CLC/prefix-cache/cluster geometry 修复 |
-| `60e36fc3` | 恢复 CLC KPP，修跨 work phase |
-| `be1c2f0c` | CUTLASS DSL 4.5.1、2CTA-only 收敛 |
-| `526b741e` | page16/32/64 page-specialized TMA |
-| `1eab0af9` | prepared launcher |
-| `68c6014e` | CLC-only，删除环境分叉 |
-| `4f1d748a` | PackGQA + K/V page-ID cache |
-| `0381108a` | graph-safe native page128 vLLM path |
-| `0d56d09f` / `8bbeb01d` | safe tail-page side-branch fix，未进入 HEAD |
-
-## 17. 代码与证据位置
-
-### 当前代码
+### 15.4 用指令证明代码路径
 
 ```text
-python/atrex/api/flash_attn_hd256_cute.py
-src/cutedsl/interface.py
+UTMACCTL.PF             descriptor prefetch
+UTMALDG.3D.2CTA        Q TMA
+UTMALDG.4D             small-page K/V TMA
+UTCQMMA.2CTA            QK/PV Tensor Core
+UTCBAR.2CTA.MULTICAST   2CTA UMMA completion
+SYNCS.*                 mbarrier arrive/trywait
+USETMAXREG.*.CTAPOOL    `setmaxnreg` 对应的 warp-role register redistribution
+MUFU.EX2 / MUFU.RCP     softmax math
+LDS.128 / STG.E.128     current vector epilogue
+LDL / STL               must not be generated by register spilling
+```
+
+## 16. 官方资料与代码位置
+
+### 16.1 NVIDIA 官方资料
+
+- [Blackwell Ultra Datasheet](https://resources.nvidia.com/en-us-blackwell-architecture/blackwell-ultra-datasheet)：B300 FP8 compute、HBM capacity/bandwidth。
+- [HGX B300 specifications](https://www.nvidia.com/en-us/data-center/hgx.md)：HGX B300 system compute 与 dense/sparse 说明。
+- [Blackwell Tuning Guide](https://docs.nvidia.com/cuda/blackwell-tuning-guide/index.html)：register、SMEM、cluster/occupancy。
+- [PTX ISA — Tensor Memory](https://docs.nvidia.com/cuda/parallel-thread-execution/#tensor-memory)：TMEM 512 columns × 128 lanes。
+- [PTX ISA — tcgen05.mma](https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-mma-instructions-mma)：2CTA Tensor Core、single-thread semantics、operand placement。
+- [PTX ISA — cp.async.bulk.tensor](https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-cp-async-bulk-tensor)：TMA、CTA group、multicast、completion mechanism。
+- [PTX ISA — mbarrier](https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-mbarrier)：transaction bytes 与 phase wait。
+- [PTX ISA — setmaxnreg](https://docs.nvidia.com/cuda/parallel-thread-execution/#miscellaneous-instructions-setmaxnreg)：CTA register pool、warpgroup 一致性、`.inc/.dec` 约束。
+- [CUDA Programming Guide — CLC](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/cluster-launch-control.html)：Blackwell work stealing。
+- [Nsight Compute Profiling Guide](https://docs.nvidia.com/nsight-compute/ProfilingGuide/index.html)：register allocation 与 local/shared spilling 动态 metrics。
+
+### 16.2 Atrex kernel 与性能证据
+
+```text
 src/cutedsl/flash_fwd_hd256_2cta_sm103.py
 op_test/test_flash_attn_hd256_cute.py
-```
 
-### 关键报告
-
-```text
 output/fa4_hd256_2cta_prefix_cache_30pct/final_results.md
-output/fa4_hd256_2cta_sm103_wheel_ncu/final_reproduction.md
 output/fa4_prefill_ncu_20260717/summary.md
 output/fa4_hd256_small_pages_20260720/summary.md
 output/test_csv_fa4_20260721/report.md
-output/page128_fa4_history_compare_20260722/report.md
-output/fa4_dev1494_benchmark_20260724/DIRECT_PUBLIC_LOCKED_DEV1494_VS_ATREX_FP8_PREFILL.md
-output/fa4_dev1503_vs_atrex_page128_20260724/FA4_DEV1503_VS_ATREX_FP8_PREFILL_COMPARISON.md
 kernel_opt_fa4_hd256_fp8_small_pages/profiles/
 ```
 
-## 18. 最终可复用经验
+## 17. 核心优化结论
 
-1. **先优化问题定义。** 专用支持面、真实 varlen ABI 和单一产品 topology 会放大后续所有 kernel 优化的价值。
-2. **把调度单位说清楚。** 2CTA 的 work、causal bound 和 CLC worker 都以 logical cluster 为单位。
-3. **把 persistent state 当状态机。** KPP slot、barrier phase 和 generation 可能跨 work 存活，不能在局部循环任意归零。
-4. **把 page、tile、页内 offset 分层。** page256 与 page16 分别覆盖“一页多 tile”和“一 tile 多页”两个方向。
-5. **masked load 也要物理安全。** 后续 mask 不能为读取未初始化 FP8 NaN 兜底。
-6. **优先看 work geometry。** 74→75 个 2CTA clusters 的 wave cliff 足以压过许多指令级优化。
-7. **优化组合需要重新验证 fast path。** PackGQA、KPP、CLC、TMA、shared-memory alias 各自有效，不代表组合后仍进入相同代码路径。
-8. **资源 knob 不单调。** stage、split point、offset、threshold 都存在同步和 occupancy 的反作用。
-9. **Host 路径也是产品性能。** compile、prepare、run 和 CUDA Graph 必须分层，动态长度不应触发 host dispatch。
-10. **用 profiler 证明机制，而不只证明变快。** wall time 给出结果，grid/SASS/counter 才能说明为什么以及是否可迁移。
+1. HD256 的核心不是增加 `q_stage`，而是利用 TMEM 的 `S/P×2 + O×1` 做 K-direction ping-pong。
+2. `tcgen05.mma.cta_group::2` 让 CTA pair 直接完成完整 D256 QK/PV，不需要软件跨 CTA reduction。
+3. 5-stage K/V TMA、2-slot S/P KPP 和 single O accumulator 是三个独立 pipeline 维度。
+4. PackGQA 不改变 physical cluster；它减少 per-head tail rounding，并可让 work count 跨过 74-cluster wave cliff。
+5. TMA 的价值主要是减少 per-thread 地址/指令并建立深异步 pipeline，不是“任何 load 换 TMA 都更快”。
+6. correction 是 online softmax 的真实数据依赖；`O_full → rescale → O_rescaled` 不能省略，只能尽量与 QK/softmax/TMA overlap。
+7. persistent CLC 让 barrier generation 跨 work 存活，KPP slot/phase 必须作为全局状态机维护。
+8. 当前 epilogue 为 TMEM→register→SMEM→register→GMEM；PackGQA/ragged mapping 是使用 vector store 而非 TMA store 的主要原因。
+9. Paged-KV 优化不仅是 payload，还包括 page-table loads、page/tile 换算和 masked tail 的物理安全。
+10. warp-role register 上限为 softmax/correction/other=`160/128/96`；O correction/epilogue 按 16 columns 流式处理，最终 spill metrics 必须为 0。
+11. 判断优化是否生效，应同时看 work geometry、SASS instruction class、TMA bytes、tensor active、barrier、spill 和 wall time。
