@@ -218,25 +218,370 @@ PV dependency              └─ next PV waits O_rescaled
 
 图中的 `QK1` 与 `SM0/P0` 可以 overlap；`QK2` 与 `SM1/P1` 可以 overlap。PV0 必须等 P0 partial-ready，PV1 还必须等 O0 correction 完成。
 
-### 3.2 Load warp 的 K/V 发射顺序
+### 3.2 TMEM 如何排布和复用
 
-K/V 共享 5-stage physical SMEM，load warp 按下面顺序推进 pipeline state：
+#### 先区分 lane、column 和数据类型
+
+每个 CTA 分配完整的：
 
 ```text
-K0 → Q → V0 → K1 → V1 → K2 → V2 → ...
+128 TMEM lanes × 512 physical columns × 32 bits
 ```
 
-关键点：
+在当前 layout 中，一条 lane 对应当前 CTA 拥有的一行 query/output；CTA0 和 CTA1 各有 128 lanes，合起来覆盖 logical M256。TMEM column 的物理宽度固定为 32 bits，因此同样是 logical N128：
 
-- Q 只加载一次；
-- K 与 V 分别占用连续 pipeline generations；
-- MMA warp 在使用 V(i) 时保持该 stage 不释放；
-- 同时等待/消费下一 stage 的 K(i+1)，发出 QK(i+1) 后立即释放 K stage；
-- 5 stages 给 load warp 足够距离预取后续 K/V，不降低当前一 CTA/SM residency。
+```text
+S: 128 FP32 values / row = 128 physical columns
+P: 128 FP8  values / row =  32 physical columns（4 个 FP8 / 32-bit column）
+O: 256 FP32 values / row = 256 physical columns
+```
 
-stage 4→5 的实测收益为 `0.8%–2.4%`；3 stages 无法隐藏 latency，16K/64K 可退化约 26%/24%；6 stages 没有进一步收益并增加同步/资源压力。
+所以“S/P slot 是 128 columns”表示这个 slot 必须先容纳完整 FP32 S；并不表示 FP8 P 也占满 128 columns。
 
-### 3.3 K-direction ping-pong 的 steady state
+#### 512 columns 的真实地址图
+
+源码中的 offset 为：
+
+```python
+tmem_s_offset      = [0, 128]
+tmem_s_to_p_offset = 64
+tmem_p_offset      = [64, 192]
+tmem_o_offset      = [256]
+```
+
+物理排布如下：
+
+```text
+physical TMEM column / CTA
+
+0                         128                       256                       512
+│  S/P slot 0              │  S/P slot 1            │  O FP32 accumulator     │
+│  S0 FP32 [0,128)         │  S1 FP32 [128,256)     │  O [256,512)            │
+│       └─ P0 [64,96)      │       └─ P1 [192,224)  │                         │
+└──────────────────────────┴─────────────────────────┴─────────────────────────┘
+          128 columns                 128 columns               256 columns
+```
+
+`P0/P1` 各自只有 32 个 physical columns，但从对应 S slot 的 `+64` column 开始。代码把 P 建成 FP8 TMEM view 时，还要乘：
+
+```text
+tP_width_ratio = sizeof(FP32) / sizeof(FP8) = 4
+```
+
+因此 `+64 physical FP32 columns` 在 FP8 typed pointer 上表现为 `+256 FP8 elements`。这个乘 4 是类型寻址换算，不是额外分配 4 倍 TMEM。`+64` 是当前 PV TMEM-A operand layout 的对齐/排布选择；P 的真实 payload 仍然只有 32 physical columns。
+
+#### 小 trick：S 读完后在同一个 slot 内原地写 P
+
+一个 slot 的生命周期为：
+
+```text
+1. UTCQMMA.2CTA(Q,K) → 写 FP32 S 到整个 128-column slot
+2. softmax waits S_full
+3. LDTM.x32：S TMEM → softmax registers
+4. mask / row-max / MUFU.EX2 / row-sum / FP8 convert
+5. STTM.x8：FP8 P registers → slot_base+64 的 32 columns
+6. UTCQMMA.2CTA(P,V) 直接从 TMEM 读取 P，累加到 O TMEM
+7. PV consumer_release 后，该 slot 才能被下一次 QK 覆盖
+```
+
+关键不是 S 和 P 同时放在 slot 中，而是它们的生命周期首尾相接：softmax 先把本线程负责的 S fragment 全部读入 registers，之后才覆盖 S region 中 `[+64,+96)` 的部分为 P。这样不需要单独再分配：
+
+```text
+2 × 32 P columns = 64 extra TMEM columns
+```
+
+省下的 columns 正好让两个 KPP slots 与 D256 O accumulator 一起塞进 512-column 上限。
+
+这也是 `P_full` barrier 同时承担“P 已可读”和“对应 S/P slot 的新 generation 已建立”的原因。若 PV 尚未消费 P，下一次 QK 不能因为 S 已被 softmax 读完就提前覆盖整个 slot。
+
+#### 小 trick：split-P 按 logical N，而不是 physical columns 描述
+
+`split_P_arrive=96` 表示 logical N128 的前 96 个 FP8 probabilities 已写完：
+
+```text
+前 75%: 96 FP8 values = 24 physical 32-bit columns
+后 25%: 32 FP8 values =  8 physical 32-bit columns
+```
+
+softmax 写完前 24 packed columns 后执行：
+
+```text
+FENCE.VIEW.ASYNC.T
+P_full partial-ready arrival
+```
+
+MMA warp 随即可以发 partial PV；剩余 8 packed columns 由 `P_full_lastsplit` 的 mbarrier 保护。这里的 `STTM.x8`、`LDTM.x32` 等 SASS 后缀描述一次 TMEM copy atom 的传输形态，不等于整个 tile 只执行一条指令。
+
+#### O 为什么只有一个 accumulator
+
+O 使用 `[256,512)` 的 256 FP32 columns，并在整个 work 生命周期中一直占用这同一块 region。这里常写的 `O0/O1/O2` 是 **同一 TMEM 地址在不同时间的状态**，不是三块物理 buffer：
+
+```text
+physical address 始终不变：tmem_o_offset = 256
+
+O_state0  ──correction for block1──► O_state0' ──accumulate PV1──► O_state1
+O_state1  ──correction for block2──► O_state1' ──accumulate PV2──► O_state2
+```
+
+以两个 K blocks 为例，online-softmax recurrence 是：
+
+```text
+O_state0 = P0 @ V0
+
+alpha1   = exp(m0 - m1)
+O_state0'= alpha1 × O_state0
+
+O_state1 = O_state0' + P1 @ V1
+```
+
+其中 `m0/m1` 是处理 block0/block1 后的 running row max。若新 block 抬高了 row max，旧 numerator 必须先乘 `alpha1`，才能与基于新 max 计算的 `P1@V1` 相加。
+
+#### correction 不会清空或释放 O
+
+correction 只以 16-column fragment 对同一个 O region 做原地 read-modify-write：
+
+```text
+O TMEM [256+c, 256+c+16)
+    ──LDTM.x16──► registers
+                     registers *= alpha
+    ◄─STTM.x16─── registers
+
+c = 0, 16, 32, ... 240
+```
+
+某个 16-column fragment 临时进入 registers 时，其余 O columns 仍留在 TMEM；该 fragment 乘完又写回原地址。整个 correction 期间 `[256,512)` 都没有变成空闲空间，也不能拿来存放第二个 partial O。
+
+全部 16 个 fragments 写回后执行：
+
+```text
+FENCE.VIEW.ASYNC.T
+signal O_rescaled
+```
+
+这时 MMA warp 才能对同一 `tmem_o_offset=256` 发下一次 PV。
+
+#### 第一次 PV 是初始化，后续 PV 都是原地 accumulate
+
+代码层只用 `O_should_accumulate` 控制同一条 PV MMA 的 accumulator 模式：
+
+```python
+O_should_accumulate = False
+
+# gemm_Pi[p_slot] 的 destination 已预绑定到 tmem_o_offset[0] = 256
+# 第一次 PV：初始化 [256,512)
+gemm_Pi[p_slot0](P0, V0, zero_init=True)
+O_should_accumulate = True
+
+# softmax1 产生 alpha1；correction 原地执行 O *= alpha1
+wait(O_full)
+correction_in_place(O_offset=256, alpha=alpha1)
+signal(O_rescaled)
+
+# 第二次 PV：读取并累加到同一个 [256,512)
+wait(P1_ready)
+wait(O_rescaled)
+gemm_Pi[p_slot1](P1, V1, zero_init=False)
+```
+
+`zero_init=False` 的数学语义是：
+
+```text
+O_destination = O_destination + P1 @ V1
+```
+
+`P1@V1` 不会先生成一份独立的 O1 再找地方存放；`UTCQMMA.2CTA` 直接把乘积累加到已有 O destination。
+
+完整依赖时序为：
+
+```text
+PV0(P0,V0, zero-init)
+    │
+    └─ signal O_full(state0)
+             │
+softmax1 ────┼─ produces alpha1 / P1
+             ▼
+correction: O *= alpha1 in place
+             │
+             └─ FENCE.VIEW.ASYNC.T → signal O_rescaled
+                                             │
+P1 ready ────────────────────────────────────┤
+                                             ▼
+PV1(P1,V1, accumulate): O += P1@V1
+                                             │
+                                             └─ signal O_full(state1)
+```
+
+因此相邻两个 PV 不能同时修改 O。流水线 overlap 来自 `QK(i+1)`、softmax/P(i)、TMA prefetch 和 correction(i-1) 使用不同执行单元/存储区域，而不是来自同时保留两份 O。
+
+第二份 O 还需要另外 256 columns，会使总需求变为 `128+128+256+256=768`，超过上限。因此当前 overlap 的方向是双缓冲 S/P，而不是双缓冲 O。
+
+#### TMEM 优化解决了什么
+
+- QK 输出直接落 TMEM，softmax 用 `LDTM` 读取，不经过 SMEM round-trip；
+- P 直接写回 TMEM，PV 把它作为 Tensor Core A operand，不经过 SMEM；
+- O 始终以 FP32 保留在 TMEM，避免每个 K block 把 D256 accumulator 写回 GMEM/SMEM；
+- S→P 做生命周期 alias，两个 slot 只占 256 columns；
+- O correction 采用 16-column streaming fragment，控制 register live set；
+- `S_full/P_full/O_full/O_rescaled` 分开管理，使三块 TMEM region 只在真实依赖处等待。
+
+PTX 语义参考：
+
+- [PTX ISA — Tensor Memory](https://docs.nvidia.com/cuda/parallel-thread-execution/#tensor-memory)
+- [PTX ISA — tcgen05.ld](https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-instructions-tcgen05-ld)
+- [PTX ISA — tcgen05.st](https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-instructions-tcgen05-st)
+
+### 3.3 SMEM 如何排布并做 5-stage TMA prefetch
+
+#### 每 CTA 的物理 SMEM 账本
+
+```text
+sQ                         32 KB   128 rows × D256 × FP8
+sK/sV shared ring          80 KB   5 stages × 16 KB
+sO                         64 KB   128 rows × D256 × BF16
+sScale/barrier/CLC/scratch ~6.27 KB
+────────────────────────────────────────────────────────
+total                     ~182.27 KB / CTA
+```
+
+这里没有 sS 和 sP：S、P、O 的 K-loop 中间态都在 TMEM。SMEM 只负责：
+
+- 保存整个 work 重用的 Q；
+- staging 未来 K/V operands；
+- 最终 epilogue 的 BF16 sO；
+- 保存 softmax scale、mbarrier 和 CLC response 等小状态。
+
+#### sK 和 sV 是两个 layout view，不是两块 80 KB buffer
+
+源码只在 `SharedStorage` 中分配 `sK`：
+
+```python
+sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
+sV = make_tensor(recast_ptr(sK.iterator, sV_layout.inner), sV_layout.outer)
+```
+
+因此 sK/sV 指向相同的 80 KB physical bytes，但使用不同的 Tensor Core operand layout：
+
+```text
+K view: QK 的 B operand，K-major
+V view: PV 的 B operand，MN-major
+```
+
+每个 physical stage 都是 16 KB/CTA：
+
+```text
+K stage: 64 tokens × D256 × FP8 = 16 KB / CTA
+V stage: 128 tokens × D128 × FP8 = 16 KB / CTA
+```
+
+两个 CTA 合起来才是完整的 32 KB logical K 或 V tile。TMA 直接写入 `make_smem_layout_b()` 生成的 swizzled operand layout，`UTCQMMA.2CTA` 随后直接读取，不再经过 register transpose 或另一块 SMEM repack。
+
+K 和 V 不能同时占用同一个 physical stage。它们通过不同 pipeline generation 在同一地址上轮流出现；full/empty mbarrier 保证旧 consumer release 前，TMA producer 不能覆盖该 stage。
+
+#### 五个 stages 实际装的是 `K,V,K,V,K`
+
+load warp 的发射顺序是：
+
+```text
+K0 → Q → V0 → K1 → V1 → K2 → V2 → K3 → V3 → ...
+```
+
+Q 有独立的 32 KB buffer 和独立 `pipeline_q`，所以不占 K/V ring。K/V producer state 每发一个 K 或 V 就 advance 一次：
+
+| Generation | Ring index | 当前内容 |
+| ---: | ---: | --- |
+| g0 | stage 0 | K0 |
+| g1 | stage 1 | V0 |
+| g2 | stage 2 | K1 |
+| g3 | stage 3 | V1 |
+| g4 | stage 4 | K2 |
+| g5 | stage 0 | V2，必须等 K0 release |
+| g6 | stage 1 | K3，必须等 V0 release |
+| g7 | stage 2 | V3，必须等 K1 release |
+
+因此初始 fill 后，五个 slots 可以同时保存：
+
+```text
+[ K0 ][ V0 ][ K1 ][ V1 ][ K2 ]
+```
+
+也就是“两对 K/V + 下一块 K”，而不是五份 K 加五份 V。stage index 回绕时 phase 自动翻转，用于区分 stage0 的 K0 generation 和后续 V2 generation。
+
+#### consumer 为什么先释放 K、后释放 V
+
+MMA warp 对一次 steady-state iteration 的 stage ownership 是：
+
+```text
+1. wait V(i)，clone v_state，但暂不 release
+2. advance 到 K(i+1)，wait K(i+1)
+3. issue QK(i+1)
+4. release K(i+1)                ← 只被本次 QK 使用
+5. wait P(i) 和 O_rescaled
+6. issue PV(i)，读取仍被 hold 的 V(i)
+7. release V(i)                  ← 到这里才真正用完
+```
+
+所以某个时刻可以出现：
+
+```text
+Tensor Core       issue QK1
+softmax warps     process S0 / write P0
+MMA dependency    still hold V0 for future PV0
+TMA engine        refill the already released K0 slot with V2
+```
+
+如果 QK 后不立即 release K stage，producer 会更早撞到 ring full；如果在 PV 前提前 release V stage，未来 TMA 可能覆盖 V(i)，产生 silent wrong result。
+
+#### producer/consumer 的完整 mbarrier 协议
+
+每个 K/V stage 有 full/empty 两个 barrier state。概念伪码为：
+
+```python
+# load warp / TMA producer
+empty[stage].wait(phase)
+full[stage].arrive_expect_tx(bytes)
+issue_UTMALDG(dst=smem_stage, completion=full[stage])
+producer_state.advance()          # 不等待 copy 完成，继续发下一 generation
+
+# MMA consumer
+full[stage].wait(phase)           # 对应 bytes 已 complete_tx
+issue_UTCQMMA_using(smem_stage)
+empty[stage].arrive()             # consumer_release，允许覆盖
+consumer_state.advance()
+```
+
+规则 2CTA TMA 的一个 logical K/V generation 是 32 KB/cluster、16 KB/CTA。small-page CTA-local TMA 则各 CTA 对本地 16 KB payload 完成计数；leader 额外等待 peer CTA 的 16-byte remote completion notification。具体 page16/32/64 的 TMA 条数和 bytes 见第 8 章。
+
+`expect_tx` 记录 bytes，不记录 TMA 指令条数。例如 page16 的 V 虽然每 CTA 发 8 条 2 KB TMA，总 transaction count 仍是 16 KB；填成 8 会破坏 barrier completion contract。
+
+#### 五阶段怎样与计算 overlap
+
+```text
+time ─────────────────────────────────────────────────────────────────►
+
+TMA producer   K0  Q  V0  K1  V1  K2      V2  K3  V3 ...
+KV ring idx    0      1   2   3   4       0   1   2
+                         │       │         ▲
+MMA              QK0     │ QK1   │ PV0     │
+                  │      │  │    │  │      │
+softmax           └─SM0/P0─┘     └─SM1/P1  │
+                                            │
+stage release   release K0 ─────────────────┘ enables refill stage0
+                hold V0 until PV0 finishes
+```
+
+TMA 是异步 copy：load warp 发出 `UTMALDG` 后可以继续构造下一 descriptor/地址并发下一 stage；Tensor Core 在已完成的旧 stage 上运行，softmax 又在 TMEM/register 上运行。三者使用不同存储区域和执行单元，只有 ring 即将覆盖未消费 stage 时 producer 才阻塞。
+
+steady state 的目标不是固定“永远领先两块”，而是让 producer 在 5-slot capacity 内尽可能前跑。实际领先距离由 TMA latency、QK/PV 时长、softmax/correction 和 barrier back-pressure 动态决定。
+
+#### Q 和 sO 为什么不与 K/V ring alias
+
+- Q 在一个 work 的所有 QK 迭代中反复使用，只在最后一个 QK 发出后 release；把它放进 K/V ring 会长期占住 stage。
+- sO 只在最终 epilogue 使用，但大小是 64 KB。当前 persistent CLC 路径没有证明下一 work 的 Q load 与上一 work 的所有 sO readers 已完全错开，因此 sQ 与 sO 保留独立 storage。
+- sO 不是 O accumulator；真正的 FP32 O 在 TMEM。sO 只把最终 BF16 fragment 重排成 `LDS.128 + STG.E.128` 友好的 layout。
+
+最终选择 5 stages 的实测依据：stage 4→5 改善约 `0.8%–2.4%`；3 stages 无法覆盖 latency，16K/64K shape 可退化约 26%/24%；6 stages没有进一步收益，还增加 SMEM/barrier 压力。由于当前已经是一 CTA/SM，5 stages增加 SMEM并未进一步降低 residency。
+
+### 3.4 K-direction ping-pong 的 steady state
 
 初始阶段：
 
@@ -390,7 +735,7 @@ global_iter  slot = iter % 2  phase = (iter / 2) & 1
 
 slot 决定访问哪个 mbarrier/TMEM region，phase 区分同一 slot 的不同 generation。只有 slot 没有 phase，会把 iteration 2 误认为 iteration 0 已完成；只有 phase 没有 slot，则无法同时保留两个在飞的 S/P。
 
-### 3.4 overlap 的实质
+### 3.5 overlap 的实质
 
 理想 steady state 同时存在五类工作：
 
@@ -404,7 +749,7 @@ SIMT/TMEM:   O correction(i-1)
 
 这不是让 QK 与 PV 在同一个 Tensor Core 上完全并发；二者仍由同一 MMA warp 排序发射。收益来自异步 `tcgen05.mma` 与不同执行单元/warp 的重叠：MMA warp 发出操作后，softmax/correction/load warps 可以独立工作，barrier 只在真正的数据依赖处阻塞。
 
-### 3.5 split-P：75% 时提前启动 PV
+### 3.6 split-P：75% 时提前启动 PV
 
 `split_P_arrive = 96`，即 N128 的 75%。softmax warps 写 P TMEM 时：
 
@@ -429,7 +774,7 @@ PV 的 partial MMA 路径带 last-split mbarrier，确保需要后 32 columns �
 
 split point 不是纯性能常量，它同时改变 TMEM producer fence、partial/full arrival 次数和 PV consumer 的合法同步节奏。
 
-### 3.6 online-softmax correction 如何与 PV 配合
+### 3.7 online-softmax correction 如何与 PV 配合
 
 softmax 每处理一个新 K block，会更新 running row max。若 max 变化，已有 O accumulator 必须乘：
 
@@ -463,7 +808,7 @@ MMA warp:
 
 `should_rescale` 是 warp-wide ballot：任意一行需要 rescale，整个 warp 都执行。因此尝试只在少数迭代跳过 correction wait 几乎没有收益。
 
-### 3.7 KPP phase 是 persistent-cluster 状态
+### 3.8 KPP phase 是 persistent-cluster 状态
 
 KPP 的 S/P slot、phase 和 producer/consumer state 都在 work loop 外创建，不能在取得新 CLC work 时清零。完整的 physical cluster、logical work、CLC KPP 和 odd-block dummy handshake 见 5.7～5.9。
 
@@ -1114,6 +1459,8 @@ NCU dynamic:
 
 K/V 每 stage 是 `16 KB / CTA`：logical cluster K 或 V tile 为 32 KB，由 CTA pair 各持有一半 operand slice。
 
+这 80 KB 不是 K、V 各一份，而是同一 storage 上的 sK/sV layout views；`K0,V0,K1,V1,K2` 的 generation 排布和 prefetch/release 时序见 3.3。
+
 sQ 和 sO 不做 alias：在 2CTA CLC persistent 生命周期内，只有在所有相关 warp 和下一 work 都不再访问 Q 后才能安全复用；当前同步协议没有提供这个证明，所以为 sO 保留独立 64 KB。
 
 ### 7.5 Tensor Memory 账本
@@ -1127,11 +1474,13 @@ PTX ISA 说明，Blackwell 5th-generation Tensor Core 的 TMEM 每 CTA 为：
 当前 HD256 kernel 使用完整 512 columns：
 
 ```text
-S/P slot 0      128 columns
-S/P slot 1      128 columns
-O accumulator   256 columns
-合计            512 columns
+S/P slot 0      [0,128)      其中 packed FP8 P0 alias [64,96)
+S/P slot 1      [128,256)    其中 packed FP8 P1 alias [192,224)
+O accumulator   [256,512)
+合计            512 physical columns
 ```
+
+P 的 logical N128 只占 32 个 32-bit physical columns；精确类型换算、S→P 生命周期复用和 `LDTM/STTM` 路径见 3.2。
 
 这解释了为什么：
 
@@ -1795,9 +2144,9 @@ kernel_opt_fa4_hd256_fp8_small_pages/profiles/
 
 ## 18. 核心优化结论
 
-1. HD256 的核心不是增加 `q_stage`，而是利用 TMEM 的 `S/P×2 + O×1` 做 K-direction ping-pong。
+1. HD256 TMEM 固定为 `S0[0,128) + S1[128,256) + O[256,512)`；packed FP8 P 分别 alias `[64,96)` 和 `[192,224)`，因此能在 512 columns 内实现双 S/P slot 加单 O accumulator。
 2. `tcgen05.mma.cta_group::2` 让 CTA pair 直接完成完整 D256 QK/PV，不需要软件跨 CTA reduction。
-3. 5-stage K/V TMA、2-slot S/P KPP 和 single O accumulator 是三个独立 pipeline 维度。
+3. sK/sV 是同一块 80 KB SMEM 的两个 layout views；5-stage ring 按 `K,V,K,V,K` generation 轮转，并与 2-slot S/P KPP、single O accumulator 形成三个独立 pipeline 维度。
 4. PackGQA 不改变 physical cluster；它减少 per-head tail rounding，并可让 work count 跨过 74-cluster wave cliff。
 5. TMA 的价值主要是减少 per-thread 地址/指令并建立深异步 pipeline，不是“任何 load 换 TMA 都更快”。
 6. correction 是 online softmax 的真实数据依赖；`O_full → rescale → O_rescaled` 不能省略，只能尽量与 QK/softmax/TMA overlap。
