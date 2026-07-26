@@ -349,6 +349,29 @@ O TMEM [256+c, 256+c+16)
 c = 0, 16, 32, ... 240
 ```
 
+为什么会想到按 columns 切分：correction 的运算是逐行标量乘法：
+
+```text
+O[row, d] *= alpha[row]
+```
+
+不同 `d` columns 之间没有 reduction 或数据依赖，因此不必把完整 D256 row 同时放进 registers。最直接的方案就是沿 D 维做 strip-mining，只保留一个可控大小的 register window。
+
+当前选择 `corr_tile_size=16` 是寄存器压力与循环/指令开销的折中：
+
+| fragment width | 每 thread 仅 O payload 的粗略寄存器数 | 处理完整 D256 的轮数 | 取舍 |
+| ---: | ---: | ---: | --- |
+| 8 columns | 约 8 | 32 | register 轻，但循环和 TMEM 指令更多 |
+| **16 columns** | **约 16** | **16** | 当前平衡点，可直接使用 `LDTM.x16/STTM.x16` |
+| 32 columns | 约 32 | 8 | 轮数更少，但与 scale、地址和 epilogue 临时量叠加后 register pressure 更高 |
+
+完整 D256 一次读入理论上仅 O payload 就约需 256 registers/thread，尚未包括 scale、pointer 和 predicate，无法用于当前 correction warp。16-column 方案的优势是：
+
+- 不增加第二块 O 或额外 SMEM scratch；
+- 大幅缩短 O fragment 的 register live range，最终 local/shared spill 保持为 0；
+- 仍以足够宽的 TMEM vector copy 和 packed FP32x2 multiply 工作；
+- `corr_tile_size` 保持为可调参数，后续可根据新编译器或新架构重新 sweep。
+
 某个 16-column fragment 临时进入 registers 时，其余 O columns 仍留在 TMEM；该 fragment 乘完又写回原地址。整个 correction 期间 `[256,512)` 都没有变成空闲空间，也不能拿来存放第二个 partial O。
 
 全部 16 个 fragments 写回后执行：
