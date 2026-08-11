@@ -1,0 +1,30 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls -la /Users/moudi/Desktop/llm_infra/infer/kernels/FlashQLA)",
+      "Read(//Users/moudi/Desktop/llm_infra/infer/kernels/FlashQLA/**)",
+      "Bash(ls /Users/moudi/Desktop/llm_infra/infer/kernels/flashinfer)",
+      "Read(//Users/moudi/Desktop/llm_infra/infer/kernels/flashinfer/**)",
+      "Bash(cd /Users/moudi/Desktop/llm_infra/infer/kernels/FlashQLA && find . -type d -not -path '*/.git/*' -not -path './.git' | head -100)",
+      "Bash(cd /Users/moudi/Desktop/llm_infra/infer/kernels/FlashQLA && find . -type f -not -path './.git/*' | sort | awk '{ \"wc -l < \\\\\"\" $0 \"\\\\\"\" | getline lines; print lines \"\\\\t\" $0 }')",
+      "Bash(cd /Users/moudi/Desktop/llm_infra/infer/kernels/flashinfer && ls -la flashinfer/gdn_kernels flashinfer/gdn_kernels/blackwell flashinfer/gdn_kernels/delta_rule_dsl flashinfer/mamba flashinfer/kda_kernels tests/gdn 2>&1 | head -100 && echo \"=== sizes ===\" && wc -l flashinfer/gdn_*.py flashinfer/gdn_kernels/*.py flashinfer/gdn_kernels/blackwell/*.py flashinfer/gdn_kernels/delta_rule_dsl/*.py flashinfer/mamba/*.py)",
+      "Bash(cd /Users/moudi/Desktop/llm_infra/infer/kernels/flashinfer && ls include/flashinfer/mamba/ csrc/ | head -80 && echo \"=== csrc gdn ===\" && ls csrc | grep -i -E \"gdn|delta|conv|mamba|ssu|ssd\")",
+      "Bash(cd /Users/moudi/Desktop/llm_infra/infer/kernels/FlashQLA && head -180 tests/ref_gdr.py)",
+      "Bash(cd /Users/moudi/Desktop/llm_infra/infer/kernels/flashinfer && sed -n '2055,2126p' flashinfer/gdn_kernels/blackwell/gated_delta_net_chunked.py)",
+      "Bash(cd /Users/moudi/Desktop/llm_infra/infer/kernels/FlashQLA && sed -n 180,300p tests/ref_gdr.py)",
+      "Bash(cd /Users/moudi/Desktop/llm_infra/infer/kernels/FlashQLA/flash_qla/ops/gated_delta_rule/chunk && for f in fused_fwd prepare_h kkt_solve cp_fwd; do echo \"=== $f: hopper vs blackwell ===\"; diff hopper/$f.py blackwell/$f.py | head -40; echo \"=== $f: hopper vs sm120 ===\"; diff hopper/$f.py blackwell_sm120/$f.py 2>/dev/null | head -30; done)",
+      "Bash(cd /Users/moudi/Desktop/llm_infra/infer/kernels/flashinfer && ls include/flashinfer/ | grep -i -E \"conv|gdn|delta|linear\" ; echo \"--- conv in csrc/include ---\" ; grep -ril \"conv1d\" csrc include | head)",
+      "Bash(cd /Users/moudi/Desktop/llm_infra/infer/kernels/FlashQLA/flash_qla/ops/gated_delta_rule/chunk && sed -n 1,120p hopper/cp_fwd.py)",
+      "Bash(cd /Users/moudi/Desktop/llm_infra/infer/kernels/flashinfer && for f in flashinfer/gdn_kernels/gdn_decode_bf16_state.py flashinfer/gdn_kernels/gdn_decode_pretranspose.py flashinfer/gdn_kernels/gdn_decode_nontranspose.py flashinfer/gdn_kernels/gdn_decode_mtp.py; do echo \"########## $f\"; sed -n '1,110p' $f; done)",
+      "Bash(cd /Users/moudi/Desktop/llm_infra/infer/kernels/FlashQLA/flash_qla/ops/gated_delta_rule/chunk && grep -n \"gemm_ss\\\\|gemm_rs\\\\|alloc_tmem\\\\|tcbar\\\\|wait_tmem\\\\|mbarrier\\\\|tmem\\\\b\\\\|T.gemm\\(\" blackwell/fused_fwd.py | head -60)",
+      "Bash(cd /Users/moudi/Desktop/llm_infra/infer/kernels/FlashQLA/flash_qla/ops/gated_delta_rule/chunk && sed -n 240,340p blackwell/fused_fwd.py)",
+      "Bash(cd /Users/moudi/Desktop/llm_infra/infer/kernels/flashinfer && echo \"########## sm90 dsl header\"; sed -n '1,120p' flashinfer/gdn_kernels/delta_rule_dsl/delta_rule_sm90.py; echo \"########## cp header\"; sed -n '28,140p' flashinfer/gdn_kernels/blackwell/gated_delta_net_cp.py; echo \"########## wy_output_only header\"; sed -n '1,90p' flashinfer/gdn_kernels/gdn_decode_bf16_wy_output_only.py)",
+      "Bash(cd /Users/moudi/Desktop/llm_infra/infer/kernels/FlashQLA/flash_qla/ops/gated_delta_rule/chunk && sed -n 464,530p blackwell/fused_fwd.py)",
+      "Bash(cd /Users/moudi/Desktop/llm_infra/infer/kernels/FlashQLA/flash_qla/ops/gated_delta_rule/chunk && grep -n \"def fused_gdr_bwd\\\\|^def \\\\|threads=\\\\|block_S\\\\s*=\\\\|block_DV\\\\s*=\\\\|# [A-Z].*=\" hopper/fused_bwd.py | head -80)",
+      "Bash(cd /Users/moudi/Desktop/llm_infra/infer/kernels/FlashQLA/flash_qla/ops/gated_delta_rule/chunk && grep -n \"^\\\\s*#\" hopper/fused_bwd.py | sed -n 1,140p)",
+      "Bash(cd /Users/moudi/Desktop/llm_infra/infer/kernels/flashinfer && sed -n '2950,3080p' flashinfer/gdn_kernels/blackwell/gated_delta_net_chunked.py)",
+      "Bash(cd /Users/moudi/Desktop/llm_infra/infer/kernels/FlashQLA/flash_qla/ops/gated_delta_rule/chunk && sed -n 1117,1205p hopper/fused_bwd.py)",
+      "Bash(cd /Users/moudi/Desktop/llm_infra/infer/kernels/flashinfer && sed -n '3390,3440p' flashinfer/gdn_kernels/blackwell/gated_delta_net_chunked.py; echo \"=== inverse 3249-3355 ===\"; sed -n '3206,3355p' flashinfer/gdn_kernels/blackwell/gated_delta_net_chunked.py)"
+    ]
+  }
+}

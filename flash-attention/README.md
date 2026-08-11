@@ -6,6 +6,7 @@
 - [`FA4_hd128_1CTA_CLC_LPT.md`](FA4_hd128_1CTA_CLC_LPT.md)：hd128 通用 SM100 forward 的 1CTA、varlen、causal、GQA、LPT、CLC，以及 PR #2218/#2346。
 - [`FA4_varlen_GQA_causal_CLC_LPT.md`](FA4_varlen_GQA_causal_CLC_LPT.md)：hd256 2CTA varlen GQA causal CLC 的支持边界、L2 locality 与建议实现路线。
 - [`FlashInfer_Blackwell_Decode_Attention.md`](FlashInfer_Blackwell_Decode_Attention.md)：FlashInfer decode attention 实现谱系；重点解释 B200/B300 上的 CuTe DSL GQA 与 TRTLLM-Gen、Flash-Decoding、GQA、KV split、Multi-CTA/CGA、KV layout、page size 和开源边界。
+- [`Atrex_FA4_SM103_Decode_Attention.md`](Atrex_FA4_SM103_Decode_Attention.md)：统一对比 FlashInfer CuTe DSL、TRTLLM-Gen cubin 与 Atrex FA4 decode；从 Flash-Decoding 数学、Multi-CTA/reduction dispatch 下钻到 ragged Q、CUDA Graph、paged KV、TMA/TMEM/DSM 与 SM103 serving 特化。
 - [`vLLM_Qwen35_PagedKV_NHD_HND_Prefill_Decode.md`](vLLM_Qwen35_PagedKV_NHD_HND_Prefill_Decode.md)：vLLM/Qwen3.5 中 Paged KV、NHD/HND、prefill/decode、prefix cache 与 FlashInfer/TRTLLM-Gen 的系统侧衔接。
 
 阅读时注意区分：
