@@ -455,4 +455,4 @@ $$
 - FLA token/chunk 参考：`fla/ops/gated_delta_rule/naive.py`
 - FlashQLA PyTorch 参考：`tests/ref_gdr.py`
 
-继续阅读：[`FlashInfer_GDN_Blackwell.md`](FlashInfer_GDN_Blackwell.md)。
+继续阅读：[`FLA_FlashInfer_GDN.md`](FLA_FlashInfer_GDN.md)。

@@ -1,6 +1,6 @@
 # FlashQLA GDN prefill：公式重排、融合与 gate-driven CP
 
-前置阅读：[`GDN_Algorithm.md`](GDN_Algorithm.md)。本文基于 `FlashQLA` commit `c18a4860ea9c`，只分析 GDN prefill 的前向算法与 kernel 优化。
+前置阅读：[`GDN_Algorithm.md`](GDN_Algorithm.md)。FLA 与 FlashInfer 的精确实现对照见 [`FLA_FlashInfer_GDN.md`](FLA_FlashInfer_GDN.md)。本文基于 `FlashQLA` commit `c18a4860ea9c`，只分析 GDN prefill 的前向算法与 kernel 优化。
 
 ## 1. 入口与主流程
 
