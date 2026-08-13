@@ -79,6 +79,146 @@ $$
 
 并对 $q_t,k_t$ 做 L2 norm。注意：这是模型层参数化，不是 GDN 算子的唯一合法接口；三个库对 `g` 参数的语义并不相同。
 
+### 1.4 从逐 token 递推到 chunk 公式
+
+chunk 公式没有改变 1.3 的算法，只是把一个 state head、一个 chunk 内按顺序计算的 $C$ 个 residual $r_i$ 改写成一次下三角求解。下面逐步建立对应关系。
+
+对一个 chunk，把入口状态记为 $S_0$，chunk 内 token 编号为 $i=1,\ldots,C$。令
+
+$$
+\gamma_i=\sum_{m=1}^{i}\log\alpha_m,
+\qquad
+G_{ij}=\begin{cases}
+e^{\gamma_i-\gamma_j},&i\ge j,\\
+0,&i<j.
+\end{cases}
+$$
+
+$e^{\gamma_i}$ 表示入口状态 $S_0$ 到 token $i$ 一共经历的衰减；$G_{ij}$ 表示 token $j$ 写入的内容传播到 token $i$ 时经历的衰减。
+
+先把 1.3 的状态更新展开。token $i$ 写入之前的状态是
+
+$$
+\boxed{
+\bar S_i=e^{\gamma_i}S_0+
+\sum_{j<i}G_{ij}k_jr_j^\top
+}.
+$$
+
+第一项是衰减后的 chunk 入口状态；第二项是 chunk 内所有更早 token 的写入。将它代回逐 token residual
+
+$$
+r_i=\beta_i(v_i-\bar S_i^\top k_i)
+$$
+
+得到
+
+$$
+r_i^\top=
+\beta_i\left[
+v_i^\top-e^{\gamma_i}k_i^\top S_0
+-\sum_{j<i}G_{ij}(k_i^\top k_j)r_j^\top
+\right].
+$$
+
+这一步是从 token 公式到 chunk 公式的关键：当前 residual $r_i$ 依赖所有 $j<i$ 的 residual，但不依赖未来 token，所以所有依赖组成一个单位下三角系统。
+
+例如 chunk 只有两个 token 时，先算出的 $r_1$ 会改变 token 2 写入前读到的状态：
+
+$$
+\begin{aligned}
+r_1^\top&=\beta_1\left(v_1^\top-e^{\gamma_1}k_1^\top S_0\right),\\
+r_2^\top&=\beta_2\left(v_2^\top-e^{\gamma_2}k_2^\top S_0-G_{21}(k_2^\top k_1)r_1^\top\right).
+\end{aligned}
+$$
+
+把包含 $r_1$ 的项移到左边，就得到一个 $2\times2$ 单位下三角方程；$C$ 个 token 只是把这个结构扩展为 $C\times C$。
+
+把 $q_i^\top,k_i^\top,v_i^\top,r_i^\top$ 分别堆成 $Q,K,V,R$ 的第 $i$ 行，其中 $Q,K\in\mathbb{R}^{C\times d_k}$、$V,R\in\mathbb{R}^{C\times d_v}$，则上式可以一次写成
+
+$$
+\left[
+I+\operatorname{strictLower}
+\left(G\odot\operatorname{diag}(\beta)KK^\top\right)
+\right]R
+=\operatorname{diag}(\beta)
+\left(V-\operatorname{diag}(e^\gamma)KS_0\right).
+$$
+
+因此定义
+
+$$
+\boxed{
+A=\left[
+I+\operatorname{strictLower}
+\left(G\odot\operatorname{diag}(\beta)KK^\top\right)
+\right]^{-1}
+},
+$$
+
+就有
+
+$$
+\boxed{
+R=A\operatorname{diag}(\beta)
+\left(V-\operatorname{diag}(e^\gamma)KS_0\right)
+}.
+$$
+
+后面的 kernel 文档把 $R$ 记为 $V_{new}$。它不是原始 $V$ 的另一种投影，而是把逐 token 的写入 residual $r_1,\ldots,r_C$ 堆起来：
+
+$$
+\boxed{V_{new}=R}.
+$$
+
+求得所有 residual 后，只需把逐 token 的 state update 和 output read 展开。chunk 结束状态为
+
+$$
+\boxed{
+S_C=e^{\gamma_C}S_0+
+\left[\operatorname{diag}(e^{\gamma_C-\gamma})K\right]^\top V_{new}
+},
+$$
+
+其中第 $j$ 行的系数 $e^{\gamma_C-\gamma_j}$ 表示第 $j$ 个写入传播到 chunk 末尾的衰减。所有 token 的输出为
+
+$$
+\boxed{
+O=s\left[
+\operatorname{diag}(e^\gamma)QS_0+
+\left(G\odot\operatorname{Lower}(QK^\top)\right)V_{new}
+\right]
+}.
+$$
+
+第一项读取衰减后的入口状态；第二项读取 chunk 内截至当前 token 已发生的写入。`Lower` 包含对角线，对应 1.3 中先更新 $S_i$、再计算 $o_i=sS_i^\top q_i$。
+
+gate 也可以从三角求逆中拆出来。令
+
+$$
+A_0=\left[I+\operatorname{strictLower}
+\left(\operatorname{diag}(\beta)KK^\top\right)\right]^{-1},
+\qquad
+D=\operatorname{diag}(e^\gamma),
+$$
+
+则 gated 系统是 $I+DLD^{-1}$，所以
+
+$$
+A=D A_0D^{-1}=G\odot A_0.
+$$
+
+这就是 FlashQLA 先求 gate-free $A_0$、使用时再乘 $G$ 的依据；FLA 和 FlashInfer non-CP 也可以直接构造 gated $A$。两种写法都精确对应同一组逐 token residual。
+
+| 1.3 的逐 token 量 | chunk 量 | 含义 |
+| --- | --- | --- |
+| $\alpha_i$ | $\gamma_i$、$G_{ij}$ | 入口状态和历史写入的累计衰减 |
+| $k_i^\top\bar S_i$ | $e^{\gamma_i}(KS_0)_i+\sum_{j<i}G_{ij}(KK^\top)_{ij}r_j^\top$ | token $i$ 写入前读到的旧内容（按行表示） |
+| $r_i$ | $V_{new}$ 的第 $i$ 行 | 实际写入 state 的 residual value |
+| 顺序计算 $r_1,\ldots,r_C$ | 下三角求解 $A$ | 一次求出 chunk 内所有因果 residual |
+| $S_i=\bar S_i+k_ir_i^\top$ | $S_C$ 公式 | 汇总入口状态和全部写入得到 chunk 末状态 |
+| $o_i=sS_i^\top q_i$ | $O$ 公式 | 入口状态读取与 chunk 内因果读取之和 |
+
 ## 2. GVA：为什么 q/k head 和状态 head 数量不同
 
 Qwen 使用 Grouped Value Attention（GVA）时，$q,k$ 的 head 数为 $H_{qk}$，$v$ 和状态的 head 数为 $H_v$，且 $H_v$ 是 $H_{qk}$ 的整数倍。同一组中的多个 value/state head 复用一个 q/k head：
@@ -146,180 +286,55 @@ Q_t -----------------------------------------> O_t = s S_t^T Q_t
 
 recurrent core 输出 $O_{core}\in\mathbb{R}^{B\times T\times H_v\times d_v}$ 和可选的 $S_{final}$。常见层实现先对每个 value head 的 $O_{core}$ 做 RMSNorm，再乘以 $\operatorname{SiLU}(z)$，合并所有 value heads，最后通过 $W_o$ 投影回 $d_{model}$ 得到层输出 $Y$。$S_{final}$ 不参与当前层的输出投影，而是写入 cache，作为该层下一段输入的 $S_{initial}$。
 
-### 3.4 给定 Qwen3.5-MoE 配置如何决定 GDN shape
+### 3.4 用给定 Qwen MoE 配置理解 shape 与瓶颈
 
-你给出的配置中，92 层按“三层 `linear_attention` + 一层 `full_attention`”重复，因此有 69 个 GDN/linear-attention 层和 23 个 full-attention 层。两类层使用不同的 head 配置，不能混用：
-
-| config 字段 | 数值 | 作用 |
-| --- | --: | --- |
-| `hidden_size` | 8192 | GDN 层输入和最终输出宽度 $d_{model}$ |
-| `linear_num_key_heads` | 16 | GDN 的逻辑 q/k head 数 $H_{qk}$ |
-| `linear_key_head_dim` | 128 | GDN 的 key/query head dimension $d_k$ |
-| `linear_num_value_heads` | 128 | GDN 的 value/state/output head 数 $H_v$ |
-| `linear_value_head_dim` | 128 | GDN 的 value/output dimension $d_v$ |
-| `linear_conv_kernel_dim` | 4 | q/k/v 短因果卷积的 kernel size |
-| `mamba_ssm_dtype` | fp32 | recurrent state 的保存/累加 dtype |
-| `attn_output_gate`、`output_gate_type` | true、swish | 启用 $z$ 分支，并在输出投影前执行 gated RMSNorm |
-| `dtype` | bf16 | 投影权重和大多数 token activation 的 dtype |
-| `rms_norm_eps` | $10^{-6}$ | 每个 value head 输出 RMSNorm 的 epsilon |
-| `num_hidden_layers`、`full_attention_interval` | 92、4 | 每 4 层插入一个 full-attention 层 |
-| `layer_types` | 69 linear + 23 full | 明确每层选择 GDN 还是 full attention |
-| `use_cache` | true | 保存每个 GDN 层的 conv state 与 recurrent state |
-| `max_position_embeddings` | 262144 | 最长序列会增加 chunk 数，但不会增大单份 GDN state |
-| `num_attention_heads`、`num_key_value_heads`、`head_dim` | 64、4、256 | 只属于 full-attention 层，不决定 GDN shape |
-
-由此得到
+这个模型的 92 层中有 69 个 `linear_attention`（GDN）层和 23 个 `full_attention` 层。`num_attention_heads=64`、`num_key_value_heads=4`、`head_dim=256` 只描述 full-attention 层；GDN 由 `linear_*` 字段决定：
 
 $$
-d_Q=d_K=16\times128=2048,
-\qquad
-d_V=d_Z=128\times128=16384,
+H_{qk}=16,\quad d_k=128,\quad H_v=128,\quad d_v=128.
 $$
 
-$$
-\frac{H_v}{H_{qk}}=\frac{128}{16}=8.
-$$
+因此 q/k 总宽度为 $16\times128=2048$，value 和 output-gate 总宽度均为 $128\times128=16384$，一个 q/k head 服务 8 个 value/state head。下表中 $B$ 是 batch size，$T$ 是本次 token 数，$N$ 是实际 sequence 数。
 
-也就是说，一个 q/k head 在逻辑上服务 8 个 value/state head。支持原生 GVA 的 kernel 可以只保存 16 个 q/k head 并在 kernel 内映射；某些模型集成会先 `repeat_interleave`，把 q/k 物化成 128 个 head，数学结果相同，但会增加 q/k activation 流量。
-
-### 3.5 该配置下一层 GDN 的逐阶段 shape
-
-下面的 $B$ 是 batch size，$T$ 是本次输入 token 数，$N$ 是实际 sequence 数。Qwen 风格实现通常把多个小投影合并成 `in_proj_qkvz` 和 `in_proj_ba`，但拆开看仍对应 q/k/v/z/beta/alpha 六条语义分支：
-
-| 阶段 | 张量 shape | dtype/说明 |
+| 计算部分 | 相关 config | shape |
 | --- | --- | --- |
-| 输入 | $X:[B,T,8192]$ | bf16 |
-| `in_proj_qkvz` 输出 | $[B,T,36864]$ | $2048_Q+2048_K+16384_V+16384_Z$ |
-| `in_proj_ba` 输出 | $[B,T,256]$ | $128_b+128_a$ |
-| q/k/v 合并卷积输入 | $[B,T,20480]$ | $2048_Q+2048_K+16384_V$；depthwise causal conv，kernel size 4 |
-| 逻辑 $Q$、$K$ | 各 $[B,T,16,128]$ | conv + SiLU 后再做 L2 norm |
-| $V$、输出门 $Z$ | 各 $[B,T,128,128]$ | $V$ 经过 conv + SiLU，$Z$ 绕过 conv |
-| $\log\alpha$、$\beta$ | 各 $[B,T,128]$ | gate 通常以 fp32 计算；$\beta=\sigma(b)$ |
-| recurrent state | $[N,128,128,128]$ | 逻辑布局 $[N,H_v,d_k,d_v]$；某些 kernel 使用转置布局 |
-| GDN core 输出 | $O_{core}:[B,T,128,128]$ | 与 $V/Z$ 同 head shape |
-| norm + swish gate 后 | $[B,T,16384]$ | 128 个 value head 合并 |
-| `out_proj` 输出 | $Y:[B,T,8192]$ | 回到 model hidden size |
+| 层输入 | `hidden_size=8192` | $X:[B,T,8192]$ |
+| q/k 投影与卷积 | 16 个 key head、head dim 128、卷积宽度 4 | $Q,K:[B,T,16,128]$ |
+| value 与输出门 | 128 个 value head、head dim 128 | $V,Z:[B,T,128,128]$ |
+| 遗忘门与写入门 | 每个 value/state head 一个标量 | $\log\alpha,\beta:[B,T,128]$ |
+| GDN state | $H_v\times d_k\times d_v$，fp32 | $S:[N,128,128,128]$ |
+| core 输出 | 与 value head 相同 | $O_{core}:[B,T,128,128]$ |
+| 合并与输出投影 | 合并 value heads 后投影到 `hidden_size` | $[B,T,16384]\to Y:[B,T,8192]$ |
 
-`in_proj_qkvz` 的宽度来自 $2d_Q+2d_V=36864$，`in_proj_ba` 的宽度来自 $2H_v=256$。因此这个 GDN 层不是“8192 hidden 对应 8192 value”；它把 value/output-gate 分支扩展到 16384，再由 `out_proj` 压回 8192。
+Qwen 实现通常把投影合并成 `in_proj_qkvz:[8192\to36864]` 和 `in_proj_ba:[8192\to256]`；q/k/v 经过宽度为 4 的 depthwise causal convolution，$Z$ 用于 core 输出后的 swish gate。支持原生 GVA 的 kernel 保留 16 个 q/k head；若集成层先把 q/k 重复成 128 个 head，会增加 activation 流量，但不改变算法。
 
-### 3.6 该配置下 state、activation 和中间量有多大
-
-每个 state head 有 $128\times128=16384$ 个 fp32 元素，即 64 KiB；128 个 state head 合计
+一份 fp32 recurrent state 的大小为
 
 $$
-128\times128\times128\times4\ \text{bytes}=8\ \text{MiB}
+128\times128\times128\times4\ \text{bytes}=8\ \text{MiB}.
 $$
 
-每条 sequence、每个 GDN 层需要 8 MiB recurrent state。69 个 GDN 层合计 552 MiB/sequence；若 tensor parallel 按 head 均匀切分，则每卡约为 $552/TP$ MiB/sequence。这个 state 大小与 $T$ 无关，$T$ 只决定状态被更新多少次。
+即每条 sequence、每个 GDN 层 8 MiB，69 个 GDN 层合计 552 MiB；按 head 做 TP 时，每卡大致再除以 TP。state 大小不随序列长度增长，但计算链会随序列增长：`max_position_embeddings=262144` 在 $C=64$ 时对应 4096 个连续 chunk。
 
-若 TP degree 为 $p$，并且 q/k head 与 value head 都按 head 均匀分片，则每卡的逻辑 core shape 为 $H_{qk}^{local}=16/p$、$H_v^{local}=128/p$，GVA group size 仍为 8，state 为 `[N,128/p,128,128]`，即 $8/p$ MiB/sequence/layer。以 TP=8 为例，每卡 $Q/K:[B,T,2,128]$、$V/O:[B,T,16,128]$、state `[N,16,128,128]`，state 为 1 MiB/sequence/layer，69 层合计 69 MiB/sequence；具体 projection GEMM 的切分与 collective 位置由模型并行实现决定。
+这个配置下最重要的瓶颈有三个：
 
-以 bf16 activation 计，每个 token 的逻辑 Q、K 各 4 KiB，V、Z、$O_{core}$ 各 32 KiB。一个 64-token chunk 的 V、Z、$O_{core}$ 各为 2 MiB，而整层 state 是 8 MiB fp32。GDN core 的关键中间量在该配置下为：
-
-| 每个 64-token chunk、全 128 个 state head | 元素数 | bf16 大小 | 是否算法必须落 HBM |
-| --- | --: | --: | --- |
-| $A$ 或 $A_0:[H_v,64,64]$ | 524,288 | 1 MiB | 否；取决于融合边界 |
-| $W:[64,H_v,d_k]$ | 1,048,576 | 2 MiB | 否；FLA 显式保存 |
-| $U$ 或 $V_{new}:[64,H_v,d_v]$ | 1,048,576 | 2 MiB | 否；FLA 显式保存/生成 |
-| 一个 chunk boundary state | 2,097,152 | 4 MiB | 否；FLA 为独立 output kernel 保存 bf16 副本 |
-| recurrent state cache | 2,097,152 | fp32 为 8 MiB | 启用 cache 时需要；只保存入口/最终状态，理想情况下跨 chunk 片上驻留 |
-
-当 $T=262144$ 且 $C=64$ 时，一条 sequence 有 4096 个 chunk。若把 4 MiB 的 boundary state 对每个 chunk 全部物化，单层就是约 16 GiB；因此 FlashInfer/FlashQLA 将 state 与 output 融合、避免保存所有 boundary state，不只是小幅 kernel 调优，而是在消除一个随 chunk 数线性增长的巨大中间张量。
-
-### 3.7 从这些 shape 看实际瓶颈
-
-1. **层外投影很宽。** `in_proj_qkvz` 是 $8192\to36864$，`in_proj_ba` 是 $8192\to256$，`out_proj` 是 $16384\to8192$；这些投影单层约有 4.383 亿参数，bf16 权重约 836 MiB。端到端 GDN 层不能只看 recurrent kernel，长序列时投影 GEMM 也是主要计算量。
-2. **core 的状态链具有严格依赖。** 每个 value head 的 64 KiB fp32 state 必须按 chunk 顺序更新。只要同一 CTA 能让 state tile 跨 chunk 驻留，HBM 流量就低；一旦拆成多个 kernel 并物化 boundary state，流量会迅速放大。
-3. **GVA 让 value 侧远宽于 q/k 侧。** $H_v/H_{qk}=8$，所以 $KS$、$QS$、$K^\top V_{new}$、state update 和 output/value activation 通常比单纯的 $QK^\top$、$KK^\top$ 更重。
-4. **长序列不增大 state，却拉长串行链。** 262144 token 对应 4096 个 chunk；低 batch 或较大 TP 会减少每卡的 local state heads，使默认 CTA 数下降，GPU 可能在一条很长的状态链上欠占用。这正是 FlashInfer 精确 CP 和 FlashQLA gate-driven CP 要解决的问题。
-5. **TP 同时降低内存和并行度。** head sharding 下，每卡 state 约除以 TP，但每卡可并行的 $H_v$ 也从 128 降为 $128/TP$。例如 TP=8 时，每卡只有 16 个 value/state head；若一个 head 的 value dimension 再切成两个 tile，默认也只有约 $B\times16\times2$ 个持久 CTA，长序列时容易不足以覆盖所有 SM。
+1. **value/state 侧很宽：** $H_v/H_{qk}=8$，因此 $KS$、$QS$、state update 和输出相关计算比 q/k 侧更重。
+2. **chunk 间有串行状态依赖：** $S_{c+1}$ 必须等待 $S_c$。长序列、低 batch 或较大 TP 会减少每卡可并行的 state head，容易出现 GPU 欠占用。
+3. **中间 state 是否落 HBM：** 若每个 chunk 都保存 boundary state，流量会随 chunk 数线性增长；让 state 跨 chunk 片上驻留，或用 CP 把长状态链拆成多个 segment，是三个优化实现的核心差别。
 
 ## 4. 为什么 prefill 要 chunk 化
 
-逐 token 递推每步只有矩阵-向量乘和 rank-1 update，无法充分使用 Tensor Core。把连续 $C$ 个 token 合成一个 chunk 后，可以把大部分工作改写为矩阵乘。三个实现最常用 $C=64$。
+逐 token 递推每步只有矩阵-向量乘和 rank-1 update，难以充分使用 Tensor Core。1.4 已经证明：把连续 $C$ 个 token 堆成矩阵后，可以用 $KK^\top$、$KS_0$、$QK^\top$、$QS_0$ 和 $K^\top V_{new}$ 这些矩阵乘，一次处理整个 chunk；三个实现最常用 $C=64$。
 
-对一个 chunk，令
+chunk 化只改变执行方式，不改变因果顺序：chunk 内用下三角求解一次得到全部 residual $V_{new}$，chunk 之间仍通过 $S_C$ 串行连接。其计算顺序可以概括为：
 
-$$
-Q,K\in\mathbb{R}^{C\times d_k},
-\qquad
-V\in\mathbb{R}^{C\times d_v},
-$$
-
-第 $i$ 行分别是 $q_i^\top,k_i^\top,v_i^\top$。定义 chunk 内累计 log decay
-
-$$
-\gamma_i=\sum_{j=1}^{i}\log\alpha_j,
-$$
-
-以及因果 pairwise decay
-
-$$
-G_{ij}=
-\begin{cases}
-\exp(\gamma_i-\gamma_j), & i\ge j,\\
-0, & i<j.
-\end{cases}
-$$
-
-### 4.1 单位下三角求解
-
-先忽略 gate，构造
-
-$$
-A_0=\left[I+\operatorname{strictLower}
-\left(\operatorname{diag}(\beta)KK^\top\right)\right]^{-1}.
-$$
-
-被求逆矩阵是单位下三角矩阵，因此逆一定存在。它编码了 chunk 内“前一个 token 的写入会改变后一个 token 读到的状态”这一因果关系。
-
-gate 可以通过对角相似变换加回去：
-
-$$
-\boxed{A=G\odot A_0}.
-$$
-
-原因是令 $D=\operatorname{diag}(e^\gamma)$ 后，gated 的严格下三角部分等于 $DLD^{-1}$，所以
-
-$$
-[I+DLD^{-1}]^{-1}=D(I+L)^{-1}D^{-1}.
-$$
-
-这解释了实现上的两种等价选择：
-
-- FLA 和 FlashInfer 非 CP 路径可以把 pairwise gate 放进 KKT/solve。
-- FlashQLA 与 FlashInfer CP 路径可以先求 gate-free 的 $A_0$，消费时再乘 $G$。
-
-### 4.2 修正 value、更新状态、生成输出
-
-令 $S_0$ 为 chunk 入口状态。定义
-
-$$
-V_{\mathrm{new}}
-=A\operatorname{diag}(\beta)
-\left(V-\operatorname{diag}(e^\gamma)KS_0\right).
-$$
-
-然后
-
-$$
-\boxed{
-S_C=e^{\gamma_C}S_0
- +\left[\operatorname{diag}(e^{\gamma_C-\gamma})K\right]^\top
- V_{\mathrm{new}}
-},
-$$
-
-$$
-\boxed{
-O=s\left[
-\operatorname{diag}(e^\gamma)QS_0
- +\left(G\odot\operatorname{Lower}(QK^\top)\right)V_{\mathrm{new}}
-\right]
-}.
-$$
-
-`Lower` 包含对角线，保证 token 能读到自己刚完成的更新。
+```text
+log(alpha) -> gamma, G
+K, beta, G -> K K^T -> triangular solve A
+K, V, S0, A -> residual writes V_new
+Q, K, V_new, S0 -> O
+K, V_new, S0 -> S_C
+```
 
 FLA 常把 $V_{\mathrm{new}}$ 拆成 WY 中间量：
 
@@ -333,7 +348,7 @@ $$
 V_{\mathrm{new}}=U-WS_0.
 $$
 
-两种形式数学等价。显式 $W/U$ 便于反向重算和复用；推理专用融合 kernel 更倾向在片上直接形成 $V_{\mathrm{new}}$，避免把它们都写回 HBM。
+这只是 1.4 中 $V_{new}$ 公式的分配律：$U$ 是与入口状态无关的当前 value 项，$WS_0$ 是需要从中扣除的旧状态读取。显式 $W/U$ 便于训练反向重算；推理专用 kernel 更倾向在片上直接形成 $V_{new}$。
 
 ## 5. Chunk 化后的数据流与真正的瓶颈
 
