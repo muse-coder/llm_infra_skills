@@ -1,10 +1,10 @@
-# FlashQLA GDN prefill：公式重排、融合与 gate-driven CP
+# FlashQLA GDN prefill：公式重排、两段式融合与 gate-driven CP
 
-前置阅读：[`GDN_Algorithm.md`](GDN_Algorithm.md)。FLA 与 FlashInfer 的精确实现对照见 [`FLA_FlashInfer_GDN.md`](FLA_FlashInfer_GDN.md)。本文基于 `FlashQLA` commit `c18a4860ea9c`，只分析 GDN prefill 的前向算法与 kernel 优化。
+前置阅读：[`GDN_Algorithm.md`](GDN_Algorithm.md)。FLA 与 FlashInfer 的精确 chunk GDN 推导见 [`FLA_FlashInfer_GDN.md`](FLA_FlashInfer_GDN.md)。本文以 [Qwen 官方 FlashQLA 文章](https://qwen.ai/blog?id=flashqla)和 `FlashQLA` commit `c18a4860ea9c` 为依据，重点解释 GDN chunked prefill 为什么演化成 FlashQLA、每个公式由哪个 kernel 负责，以及 Auto-CP 在哪里引入近似。
 
-## 1. 从逐 token GDN 到 FlashQLA
+## 1. FlashQLA 要解决的不是一个，而是两个相互牵制的瓶颈
 
-逐 token GDN 维护
+逐 token GDN 维护状态 $S_t\in\mathbb{R}^{K\times V}$：
 
 $$
 \bar S_t=\alpha_tS_{t-1},
@@ -18,257 +18,213 @@ S_t=\bar S_t+k_tr_t^\top,
 o_t=sS_t^\top q_t.
 $$
 
-精确 chunk GDN 将一个 chunk 的 residual 堆成 $V_{new}$，并通过 gated 三角逆
+精确 chunk GDN 将 chunk 内的 token 递推改写成三角求解和矩阵乘，但 chunk 之间仍通过边界状态 $S_i$ 串行连接。FLA 的经典实现把一个 chunk 的前向拆成四组计算：求三角逆 $A_i$，生成 $W_i/U_i$，生成修正 value $V'_i$ 并更新状态，最后生成输出 $O_i$。
+
+这产生两个方向相反的性能问题：
+
+1. 多 kernel 流程会重复读取 $K/V$，并把 $W/U/V'$、chunk boundary state 等中间量写入 HBM 后再读回，大部分阶段容易受显存带宽和 kernel launch 开销限制。
+2. 如果把所有阶段完全融合，一个 CTA 必须持有状态并串行消费多个 chunk；其 grid 主要只有 `batch × state_heads × value_tiles`，在小 batch、高 TP 或 state head 数较少时又没有足够 CTA 占满 GPU。
+
+因此 FlashQLA 的核心不是“融合得越多越好”，而是在两个目标之间选择边界：用独立 kernel 并行求所有 chunk 的三角逆，在状态递推前保留可插入 CP preprocessing 的位置，再用一个主 fused kernel 合并修正 value、状态更新和输出计算。
+
+```text
+减少 HBM 流量                         增加状态链并行度
+      \                                  /
+       \                                /
+        独立 solve -> optional CP -> fused state/output
+```
+
+## 2. 从 FLA chunk 公式到 FlashQLA 公式
+
+### 2.1 统一 gate 记号
+
+代码输入的 `g` 是 $\log\alpha_t$。对一个长度为 $C$ 的 chunk，定义累计 log gate、累计 gate 和 pairwise decay：
 
 $$
-A=\left[I+\operatorname{strictLower}
-\left(G\odot\operatorname{diag}(\beta)KK^\top\right)\right]^{-1}
+\gamma_t=\sum_{u=1}^{t}\log\alpha_u,
+\qquad
+d_t=e^{\gamma_t},
+\qquad
+D=\operatorname{diag}(d),
 $$
 
-一次求出。FlashQLA 在这个精确 chunk 公式上继续做两层演化：
+$$
+\Gamma_{ij}=
+\begin{cases}
+e^{\gamma_i-\gamma_j},&i\ge j,\\
+0,&i<j.
+\end{cases}
+$$
+
+本文的 $\gamma$ 表示累计 log gate，$d=e^\gamma$ 才是累计乘积。代码中的 `chunk_local_cumsum(g)` 生成前者；消费侧再计算指数或 `exp2`。这一区分可以避免把官方公式中常用的累计 gate $\gamma$ 与代码张量 `gamma` 混为一谈。
+
+### 2.2 原始精确 chunk 流程
+
+令 $Q,K\in\mathbb{R}^{C\times K}$、$V\in\mathbb{R}^{C\times V}$，$\beta\in\mathbb{R}^{C}$。原始 gated 三角逆为
+
+$$
+A_g=\left[I+\operatorname{strictLower}
+\left(\operatorname{diag}(\beta)(\Gamma\odot KK^\top)\right)\right]^{-1}.
+$$
+
+接下来依次计算
+
+$$
+W=A_g\operatorname{diag}(\beta)DK,
+\qquad
+U=A_g\operatorname{diag}(\beta)V,
+$$
+
+$$
+V'=U-WS_i,
+$$
+
+$$
+S_{i+1}=d_C S_i+K^\top\operatorname{diag}(d_C/d)V',
+$$
+
+$$
+O=s\left[DQS_i+\left(\Gamma\odot\operatorname{Lower}(QK^\top)\right)V'\right].
+$$
+
+这里的 $V'$ 就是 chunk 内所有 token 完成 delta-rule 去重后的修正 value。它与 [`FLA_FlashInfer_GDN.md`](FLA_FlashInfer_GDN.md) 中从三角系统求出的 $V_{new}$ 是同一个算法量，只是不同实现使用了不同名字。
+
+### 2.3 把 gate 从三角求逆中拿出来
+
+定义 gate-free 三角逆
+
+$$
+A_0=\left[I+\operatorname{strictLower}
+\left(\operatorname{diag}(\beta)KK^\top\right)\right]^{-1}.
+$$
+
+由于 pairwise decay 可以写成对角相似变换，严格下三角部分满足
+
+$$
+I+DLD^{-1}=D(I+L)D^{-1},
+$$
+
+所以
+
+$$
+A_g=D A_0D^{-1}=\Gamma\odot A_0.
+$$
+
+这是严格代数等价，不是近似。将它代回 $V'=U-WS_i$：
+
+$$
+R=V-DKS_i,
+$$
+
+$$
+V'=(\Gamma\odot A_0)\operatorname{diag}(\beta)R.
+$$
+
+因此旧流程与 FlashQLA 的量一一对应：
+
+| 原始 chunk 量 | FlashQLA 重排后的量 | 对应关系 |
+| --- | --- | --- |
+| gated inverse $A_g$ | gate-free $A_0$ 与现场生成的 $\Gamma$ | $A_g=\Gamma\odot A_0$ |
+| $U=A_g\operatorname{diag}(\beta)V$ | 不单独生成 | 合并到 $V'$ |
+| $W=A_g\operatorname{diag}(\beta)DK$ | 不单独生成 | 合并到 $V'$ |
+| $V'=U-WS_i$ | $R=V-DKS_i$，再左乘 $(\Gamma\odot A_0)\operatorname{diag}(\beta)$ | 完全相同的修正 value |
+| state update | fused kernel 内直接消费 $V'$ | 公式不变 |
+| output | fused kernel 内直接消费 $S_i$ 和 $V'$ | 公式不变 |
+
+这一步的价值是同时消除显式 $W/U$，并让三角求逆只依赖 $K,\beta$；pairwise gate 留到主 fused kernel 中按需生成。
+
+## 3. FlashQLA 普通路径的完整数据流
+
+公开入口 `flash_qla/ops/gated_delta_rule/chunk/__init__.py::chunk_gated_delta_rule` 接收：
 
 ```text
-逐 token GDN
-   -> 精确 chunk GDN
-   -> A = G ⊙ A0：三角求逆与 gate 解耦
-   -> kkt_solve(A0) + fused_gdr_fwd：重选 kernel 边界
-   -> gate-driven Auto-CP：快速衰减 head 使用有限 warmup
-                           慢速衰减 head 使用完整 M 精确修正
+q:             [B, T, Hqk, K]
+k:             [B, T, Hqk, K]
+v:             [B, T, Hv,  V]
+g:             [B, T, Hv]          # log(alpha)
+beta:          [B, T, Hv]
+initial_state: [N, Hv, K, V]
 ```
 
-前三个箭头都是严格代数等价，不改变 GDN；最后一个 Auto-CP 箭头中，快速衰减 head 会截断足够早的历史，引入有绝对衰减界的近似，慢速衰减 head 仍走精确 fallback。因此 FlashQLA 的普通路径是精确 GDN，算法层调优只发生在启用 Auto-CP 且满足截断条件的 head 上。
-
-## 2. 入口与主流程
-
-公开入口是 `flash_qla/ops/gated_delta_rule/chunk/__init__.py::chunk_gated_delta_rule`。它接收 log-space gate：
+本文分析的主路径使用 $C=64$，Qwen GDN 的主要 shape 是 $K=V=128$。普通前向按以下顺序执行：
 
 ```text
-q:    [B, T, Hqk, K]
-k:    [B, T, Hqk, K]
-v:    [B, T, Hv,  V]
-g:    [B, T, Hv]       # log(alpha)，不是 alpha
-beta: [B, T, Hv]
-state:[N, Hv, K, V]
-```
-
-SM90/SM100/SM103 的基本 chunk size 为 64，主优化 shape 是 $K=V=128$。前向首先执行：
-
-```text
-chunk_local_cumsum(g) -> gamma
-kkt_solve(k, beta)    -> A0
-optional auto-CP preprocess -> 每个分段的入口状态
-fused_gdr_fwd(q, k, v, A0, gamma, beta, state) -> O, final_state
-```
-
-因此正常路径的数学主体是“gate cumsum + gate-free KKT/solve + fused state/output”三段，而不是把三角求逆也塞进主 fused kernel。
-
-### 2.1 普通路径的数据如何流动
-
-```text
-Q, K ------------------------------> optional L2 norm
 log(alpha) ------------------------> chunk_local_cumsum -> gamma [HBM]
 K, beta ---------------------------> kkt_solve          -> A0 [HBM]
 
 initial_state S0
    + Q, K, V, gamma, beta, A0 -----> fused_gdr_fwd
-                                      for chunk c = 0..N-1:
-                                        P = Q K^T
-                                        U = K S_c
-                                        R = V - exp(gamma) U
-                                        V_d = (G * A0) diag(beta) R
-                                        O_c = cross-state output + local output
-                                        S_(c+1) = decayed S_c + K^T V_d
+                                      for chunk i = 0..Nc-1:
+                                        P  = Q K^T
+                                        U  = K S_i
+                                        R  = V - D U
+                                        V' = (Gamma * A0) diag(beta) R
+                                        O  = cross-state output + local output
+                                        S_(i+1) = decayed S_i + K^T scaled(V')
                                       -> O [HBM]
                                       -> final_state [optional HBM]
 ```
 
-`kkt_solve` 对所有 `(chunk,state-head)` 并行，产生 gate-free $A_0$；`fused_gdr_fwd` 再按 `(sequence,state-head,value-tile)` 启动 CTA，每个 CTA 把 state tile 留在片上并串行消费多个 chunk。跨 kernel 必须物化的主要中间量只有 $\gamma$ 和 $A_0$，而 $R,V_d$、boundary state 与 output partial 不落 HBM。
+`kkt_solve` 以 `(chunk,state-head)` 为并行维度，一次处理所有 chunk，不依赖前一个 chunk 的状态。`fused_gdr_fwd` 以 `(sequence,state-head,value-tile)` 为主要并行维度，每个 CTA 将 state tile 留在片上并串行消费属于该序列的 chunk。
 
-### 2.2 Auto-CP 路径的数据如何流动
+普通路径中跨 kernel 物化的主要中间量只有累计 gate `gamma` 和 $A_0$。$R/V'$、chunk boundary state 和 output partial 都在主 fused kernel 内产生并立即消费。普通路径从逐 token GDN 到最终输出完全精确，只改变代数表达和 kernel 边界。
 
-auto-CP 启用时，$\gamma$ 和 $A_0$ 仍先按普通路径生成；随后 preprocessing 把原 sequence 切成 segment，并为每段准备入口状态：
+## 4. 为什么 Exact CP 需要 $M$，又为什么它很贵
+
+主 fused kernel 的 chunk 链是串行的。要让不同 segment 同时运行，必须先知道每个 segment 的入口状态。对第 $j$ 个 segment，其全部 token 对入口状态构成一个仿射映射：
+
+$$
+S_{j,\mathrm{out}}=M_jS_{j,\mathrm{in}}+N_j.
+$$
+
+其中：
+
+- $N_j$ 是以零状态进入该 segment 后，由该段 token 自己写入的局部状态。
+- $M_j$ 是入口状态穿过该 segment 后保留下来的线性转移。
+
+Exact CP 先并行计算每段的 $(M_j,N_j)$，再按 segment 顺序组合
+
+$$
+S_{j+1,\mathrm{in}}=M_jS_{j,\mathrm{in}}+N_j,
+$$
+
+从而得到所有 segment 的真实入口状态，最后让各 segment 的主计算并行运行。这个方案不改变 GDN，但 $M_j\in\mathbb{R}^{K\times K}$；递推和保存完整 $M$ 的代价可能高于状态局部项 $N$，而且必须在主 fused kernel 之前完成。
+
+这解释了 FlashQLA 为什么保留如下两段式边界：
 
 ```text
-gamma + segment boundaries ------------> warmup chunk count / fallback mask
-K, V, A0, gamma, beta + zero state -----> suffix state; fallback heads get full N
-slow-decay fallback heads --------------> full local transition M
-local state, optional M, raw initial_state -> correct_initial_states
-                                           -> initial_state[segment]
-
-Q, K, V, A0, gamma, beta
-   + initial_state[segment] --------------> fused_gdr_fwd over all segments in parallel
-                                           -> token O + original sequence final_state
+kkt_solve(A0)
+      ↓
+optional CP preprocess: 计算 segment initial states
+      ↓
+fused_gdr_fwd: 各 segment 并行计算 V'、S、O
 ```
 
-快衰减 head 的 segment initial state 来自有限 suffix warmup，是带 $e^{-10}$ 绝对衰减界的近似；慢衰减 head 使用完整 $M$ 沿 segment 修正，保持精确历史。preprocess 只改变传给 `fused_gdr_fwd` 的 `initial_state`、`cu_seqlens` 和 sequence mapping，不改变 token 的 q/k/v 排列或最终 output 顺序。
+完全融合虽然减少 HBM 流量，却没有地方插入 segment initial-state correction；完全依赖 Exact CP 又会付出昂贵的 $M$。FlashQLA 的 gate-driven Auto-CP 正是为了只在确有必要的 head 上计算完整 $M$。
 
-### 2.3 各阶段 shape
+## 5. Gate-driven Auto-CP：从精确修正到有界 warmup
 
-| 张量 | 逻辑 shape | 给定 Qwen 配置、$C=64$ 时的大小 |
-| --- | --- | --- |
-| $Q,K$ | `[B,T,Hqk,K]` | `[B,T,16,128]` |
-| $V,O$ | `[B,T,Hv,V]` | `[B,T,128,128]` |
-| $\gamma,\beta$ | `[B,T,Hv]` | 每个 chunk 各 `[64,128]` |
-| $A_0$ | `[B,T,Hv,C]` | 每个 chunk `[128,64,64]`，bf16 为 1 MiB |
-| ordinary initial/final state | `[N,Hv,K,V]` | fp32 为 8 MiB/sequence/layer |
-| CP segment initial state | `[num_segments,Hv,K,V]` | 每段一份入口 state |
-| fallback $M$ | 概念上 `[num_segments,Hv,K,K]` | 只为慢衰减 head 参与精确修正 |
+### 5.1 它如何增加 GPU 并行度
 
-普通路径每个 chunk 将约 1 MiB 的 $A_0$ 写到 HBM，再由 fused kernel 读取；$R,V_d$ 和 boundary state 不作为跨 kernel 接口。保留独立 $A_0$ 的目的是让求逆使用完全并行的 grid、为训练 backward 保存检查点，并降低主 fused kernel 的资源压力。
-
-## 3. 从公式看 FlashQLA 优化了什么
-
-精确 chunk GDN 的 gated triangular inverse 是
-
-$$
-A=G\odot A_0,
-$$
-
-其中
-
-$$
-A_0=\left[I+\operatorname{strictLower}
-\left(\operatorname{diag}(\beta)KK^\top\right)\right]^{-1},
-$$
-
-$$
-G_{ij}=\begin{cases}e^{\gamma_i-\gamma_j},&i\ge j,\\0,&i<j.\end{cases}
-$$
-
-由此可写出 FlashQLA kernel 实际采用的计算次序：
-
-$$
-R=V-\operatorname{diag}(e^\gamma)KS_{\mathrm{prev}},
-$$
-
-$$
-V_d=(G\odot A_0)\operatorname{diag}(\beta)R,
-$$
-
-$$
-S_{\mathrm{next}}=e^{\gamma_C}S_{\mathrm{prev}}
-+\left[\operatorname{diag}(e^{\gamma_C-\gamma})K\right]^\top V_d,
-$$
-
-$$
-O=s\left[\operatorname{diag}(e^\gamma)QS_{\mathrm{prev}}
-+\left(G\odot\operatorname{Lower}(QK^\top)\right)V_d\right].
-$$
-
-公式到 kernel 的映射为：
-
-| 公式部分 | FlashQLA kernel | 优化角度 |
-| --- | --- | --- |
-| $\gamma$ | `chunk_local_cumsum` | log 域累计，消费时用 `exp2` |
-| $A_0$ | `kkt_solve` | gate-free 求逆；$16\to32\to64$ 分块合并 |
-| $R,V_d$ | `fused_gdr_fwd` | 不生成显式 $W/U$，直接形成修正 value |
-| $S_{next}$ | `fused_gdr_fwd` | 状态驻留 fp32 fragment/TMEM，逐 chunk 更新 |
-| $O$ | `fused_gdr_fwd` | $QS$ 与 gated $QK^\top V_d$ 在同一流水内完成 |
-| 长序列状态链 | CP preprocess + `fused_gdr_fwd` | gate 决定有限 warmup；慢衰减时用 $M$ 精确修正 |
-
-FlashQLA 的优化主线有三条：
-
-1. 用相似变换把 gate 从三角求逆中拿出来，简化独立的 solve kernel。
-2. 把 $V_{new}$、state update 和 output 合进一个 warp-specialized kernel，消除显式 $W/U/V_{new}/H$ 的大部分全局中间流量。
-3. 当 chunk 间串行导致并行度不足时，利用 gate 的指数遗忘缩短状态依赖；不能截断的 head 才计算完整转移矩阵修正。
-
-## 4. `kkt_solve`：先求 gate-free 的 $A_0$
-
-实现位于 `flash_qla/ops/gated_delta_rule/chunk/blackwell/kkt_solve.py`。每个 CTA 对一个 `(chunk, state-head)` 工作，使用 128 threads。
-
-### 4.1 为什么求逆里没有 gate
-
-kernel 只读取 $K$ 和 $\beta$：
-
-1. Tensor Core 计算 $KK^\top$。
-2. 每一行乘 $\beta_i$。
-3. 保留严格下三角并把对角设为 1。
-4. 求单位下三角逆 $A_0$。
-
-pairwise gate $G$ 留到 `fused_gdr_fwd` 中逐元素乘到 $A_0$。这由
-
-$$
-[I+DLD^{-1}]^{-1}=D(I+L)^{-1}D^{-1}
-$$
-
-保证，而不是近似。这样 `kkt_solve` 不需要加载 gate、计算 $C^2$ 个指数，也使 $A_0$ 能作为干净的 backward 检查点。
-
-### 4.2 分块求逆
-
-$64\times64$ 的求逆分三层：
-
-1. 四个 $16\times16$ 对角块做短前代。
-2. 两组 $16\to32$ 合并。
-3. 一次 $32\to64$ 合并。
-
-合并使用
-
-$$
-\begin{bmatrix}A&0\\B&D\end{bmatrix}^{-1}
-=\begin{bmatrix}A^{-1}&0\\-D^{-1}BA^{-1}&D^{-1}\end{bmatrix}.
-$$
-
-块内串行工作只剩 16 步，跨块部分转成矩阵乘。最终 $A_0$ 写成输入 dtype，形状为 `[B,T,Hv,64]`；主 fused kernel 再加载它。
-
-求逆没有与主 kernel 融合，是有意的边界：求逆按 `(chunk,head)` 完全并行，而主 kernel 按 `(sequence,head,value-tile)` 持有并递推状态。两者的最佳 grid 和片上资源需求不同。
-
-## 5. `fused_gdr_fwd`：融合其余四个公式块
-
-SM100 实现位于 `flash_qla/ops/gated_delta_rule/chunk/blackwell/fused_fwd.py`。一个 CTA 使用 512 threads，按四个 warpgroup 分工。
-
-### 5.1 公式执行顺序
-
-每个 chunk 内的主要矩阵运算是：
-
-1. $P=QK^\top$。
-2. $U=KS_{prev}$。
-3. $O_{inter}=QS_{prev}$。
-4. $R=V-e^\gamma U$。
-5. 现场构造 $G$，并形成 $A_g=(G\odot A_0)\operatorname{diag}(\beta)$。
-6. $V_d=A_gR$。
-7. $O=e^\gamma sO_{inter}+s(G\odot P)V_d$。
-8. $S\leftarrow e^{\gamma_C}S+[\operatorname{diag}(e^{\gamma_C-\gamma})K]^\top V_d$。
-
-FlashQLA 没有独立的 `recompute_w_u`、state-scan 和 output kernel，也不把 $W/U/V_d$ 作为跨 kernel 接口。这是它减少 HBM 流量的主要来源。
-
-### 5.2 为什么仍保留 `kkt_solve`
-
-若连 $KK^\top$ 和三角求逆也融合，单 CTA 同时需要：状态矩阵、Q/K/V、两个 $64\times64$ score、三角逆、value/output accumulator。资源和同步链会过长，并且求逆阶段无法像独立 grid 那样按所有 chunk 并行。
-
-因此 FlashQLA 的融合边界是：
-
-```text
-完全并行且资源形态特殊的 triangular solve | 依赖状态的主流水
-```
-
-这个边界把资源形态特殊、完全并行的求逆阶段，与需要持有 recurrent state 的主流水分开。
-
-### 5.3 Warp specialization 如何服务公式依赖
-
-四个 warpgroup 分别持有不同的数据：
-
-| threads | 主要职责                                   |
-| ------- | ------------------------------------------ |
-| 0–127   | 持有并更新 $S$                             |
-| 128–255 | 形成 residual、$V_d$ 和 state-update value |
-| 256–383 | 构造 $G/A_g$，组合 output                  |
-| 384–511 | 发射 tcgen05 MMA、TMA load 和 store        |
-
-Q/K/V/$A_0$/gate 使用双缓冲；状态以 fp32 fragment/TMEM 保存。对 $V=128$，状态拆成左右两个 64-column tile，以适配 TMEM 和 MMA tile。这里的硬件分工来自公式依赖：state owner 串行维护 $S$，value owner 处理 $KS\to R\to V_d$，output owner 处理 $QK^\top$、pairwise gate 和 $O$；producer 只负责异步搬运/MMA 发射。
-
-## 6. Gate-driven intra-card CP
-
-默认 fused kernel 的 CTA 数近似为
+不使用 CP 时，CTA 数量近似为
 
 $$
 B\times H_v\times\left\lceil V/B_V\right\rceil,
 $$
 
-每个 CTA 内部仍串行遍历 chunk。长序列、小 batch、少 head 时，这一数量不足以占满 GPU。FlashQLA 的 `auto_cp` 把一条序列切成多个 segment，让 segment 也进入并行维度。
+而每个 CTA 内部仍需串行遍历 chunk。intra-card Auto-CP 在一张 GPU 内把 grid 扩展为
 
-### 6.1 为什么可以只 warmup 一段有限历史
+```text
+(sequence, state_head, value_tile)
+                 ↓
+(sequence, segment, state_head, value_tile)
+```
 
-设两次递推只有入口状态不同，误差为 $\Delta S$。由逐 token GDN recurrence 可得
+它不是把张量分到多张卡，而是把一条长状态链切成更多可并行的 segment CTA。这对长序列、小 batch、较少本地 head 或高 TP 场景尤其重要。
+
+### 5.2 为什么有限 warmup 可以代替部分 $M$
+
+设两个递推只有入口状态不同。按本文 $S\in\mathbb{R}^{K\times V}$ 的方向，误差满足
 
 $$
 \Delta S_t=\alpha_t(I-\beta_tk_tk_t^\top)\Delta S_{t-1}.
@@ -277,74 +233,182 @@ $$
 当 $\lVert k_t\rVert_2=1$ 且 $0\le\beta_t\le2$ 时，$I-\beta_tk_tk_t^\top$ 的谱范数为 1，因此
 
 $$
-\lVert\Delta S_{out}\rVert
-\le e^{\sum\log\alpha}\lVert\Delta S_{in}\rVert.
+\lVert\Delta S_{\mathrm{out}}\rVert
+\le e^{\sum_t\log\alpha_t}\lVert\Delta S_{\mathrm{in}}\rVert.
 $$
 
-`get_warmup_chunks` 从一个 segment 的尾部向前累计 chunk-end log gate，并对每个 head 找到第一个
+对目标 segment 的起点，Auto-CP 从该点向前检查累计 gate。如果某个 suffix 已满足
 
 $$
-\sum\log\alpha<-10
+\sum_t\log\alpha_t<-10,
 $$
 
-的位置。对该 head，只从零状态重放这几个 suffix chunk，就能近似得到 segment 结束状态；它将作为下一 segment 的入口状态。被截断的更早历史最多剩 $e^{-10}\approx4.54\times10^{-5}$ 的绝对影响。
-
-这是 gate 驱动而不是固定窗口：衰减快的 head 回看少，衰减慢的 head 回看多。
-
-### 6.2 慢衰减 head 的精确 fallback
-
-如果扫描完整个 segment 仍未达到阈值，`fallback_mask=True`。此时 `prepare_h` 运行整个 segment，既得到零初态下的精确局部项 $N$，也计算该段对入口状态的转移矩阵 $M$：
+就从这个 suffix 的起点以零状态开始重放 warmup，得到目标 segment 的近似入口状态。这里 $e^{-10}\approx4.54\times10^{-5}$ 是“入口状态误差还能保留多少”的相对衰减因子：
 
 $$
-S_{out}=MS_{in}+N.
+\lVert\Delta S_{\mathrm{segment\ start}}\rVert
+\le e^{-10}\lVert\Delta S_{\mathrm{warmup\ start}}\rVert.
 $$
 
-`correct_initial_states` 沿 segment 顺序执行
+它不是与入口状态大小无关的绝对误差上界。数学上，这条 fast-decay 路径确实截断了更早历史，因此属于近似；官方实测中约 60%–80% 的 linear-attention head 具有明显衰减，通常 warmup 6–8 个 chunk 后误差已经进入数值噪声范围。
+
+### 5.3 慢衰减 head 仍走精确 fallback
+
+如果回看完整个候选范围仍未达到衰减阈值，说明该 head 不能安全截断。此时 preprocessing 计算完整 $(M_j,N_j)$，并按
 
 $$
-S_{i+1}=M_iS_i+N_i
+S_{j+1,\mathrm{in}}=M_jS_{j,\mathrm{in}}+N_j
 $$
 
-来得到真实入口。对于已达到阈值的 head，不再乘完整 $M$，直接采用 suffix warmup 得到的近似 outgoing state；对于慢衰减 head，使用完整的 $(M,N)$ 精确传递历史。
+精确传播历史。因此 Auto-CP 是按 head 选择的混合策略：
 
-所以 FlashQLA CP 是一个混合策略：
+| head 类型 | segment 入口状态如何得到 | 是否近似 | 代价 |
+| --- | --- | --- | --- |
+| fast-decay | 从零状态重放有限 suffix | 是；误差受累计 gate 衰减约束 | 不计算完整 $M$ |
+| slow-decay | 计算并组合完整 $(M,N)$ | 否 | 支付完整转移矩阵代价 |
 
-- 快衰减 head：利用模型性质近似截断，减少转移矩阵 GEMM。
-- 慢衰减 head：仿射转移精确修正，不强行截断。
+Auto-CP 数据流为：
 
-### 6.3 分段长度与启用条件
+```text
+gamma + segment boundaries -----------> warmup length / fallback mask
 
-`_calc_cp_seqs` 用
+fast-decay head:
+K, V, A0, gamma, beta + zero state ---> suffix warmup -------> segment S0
+
+slow-decay head:
+K, V, A0, gamma, beta ----------------> exact local (M, N)
+raw initial_state + all (M, N) --------> sequential correction -> segment S0
+
+Q, K, V, A0, gamma, beta + segment S0
+                                      -> fused_gdr_fwd over segments in parallel
+                                      -> token O + original sequence final_state
+```
+
+切段还需要平衡段内串行时间和段间 correction 时间。若总共有 $N_c$ 个 chunk、每段含 $L$ 个 chunk，可用
 
 $$
-L_{segment}\propto
-\sqrt{H_v\times\text{num\_chunks}/\text{num\_SM}}
+T(L)\approx aL+b\frac{N_c}{L}
 $$
 
-的延迟模型选择每段 chunk 数，再对齐到 2 的幂并保证至少 4 chunk。随后还按架构、有效 batch-head 数和最长序列 chunk 数判断 CP 固定开销是否值得。
+描述两部分代价，因此最优长度具有 $L^\star=\lambda\sqrt{N_c}$ 的形式；$\lambda$ 还取决于 batch、head 数和硬件。具体启用阈值是版本与架构相关的性能 heuristic，只决定是否值得切段，不改变 fast-decay 近似与 slow-decay 精确 fallback 的正确性策略。
 
-这一启发式不改变算法正确性策略；它只决定何时用“更多短状态链 + correction”替代“更少的长状态链”。
+## 6. 两个主 kernel 分别优化哪部分公式
 
-## 7. FlashQLA 的算法与 kernel 演化总结
+### 6.1 `kkt_solve`：计算 gate-free $A_0$
+
+Blackwell 实现位于 `flash_qla/ops/gated_delta_rule/chunk/blackwell/kkt_solve.py`。每个 CTA 负责一个 `(chunk,state-head)`：
+
+1. Tensor Core 计算 $KK^\top$。
+2. 每行乘对应的 $\beta_i$。
+3. 保留严格下三角并将对角设为 1。
+4. 求单位下三角逆 $A_0$。
+
+对 $C=64$，实现先求四个 $16\times16$ 对角块，再进行 $16\to32\to64$ 的块合并。块合并使用
+
+$$
+\begin{bmatrix}A&0\\B&D\end{bmatrix}^{-1}
+=\begin{bmatrix}A^{-1}&0\\-D^{-1}BA^{-1}&D^{-1}\end{bmatrix}.
+$$
+
+这样只有短小的块内前代保持串行，跨块工作转成矩阵乘。求逆不与主 kernel 融合，是因为 solve 希望以所有 `(chunk,head)` 形成完全并行的 grid，而主 kernel 必须以 `(sequence,head,value-tile)` 持有并递推状态；两者最合适的 grid、寄存器和片上存储需求不同。
+
+### 6.2 `fused_gdr_fwd`：计算 $V'$、状态和输出
+
+Blackwell SM100 实现位于 `flash_qla/ops/gated_delta_rule/chunk/blackwell/fused_fwd.py`。每个 chunk 内执行：
+
+1. $P=QK^\top$，$U=KS_i$，并计算跨 chunk 输出项 $QS_i$。
+2. $R=V-DU$。
+3. 现场构造 $\Gamma$，形成 $A_g=(\Gamma\odot A_0)\operatorname{diag}(\beta)$。
+4. $V'=A_gR$。
+5. $O=s[DQS_i+(\Gamma\odot\operatorname{Lower}(P))V']$。
+6. $S_{i+1}=d_CS_i+K^\top\operatorname{diag}(d_C/d)V'$。
+
+$R/V'$、输出 partial 和 chunk boundary state 都不作为跨 kernel 接口。Q/K/V/$A_0$/gate 使用流水化加载，状态以 fp32 fragment 或片上存储保留，使数据搬运、Tensor Core 计算和 CUDA Core 标量计算重叠。
+
+FlashQLA 采用一个 producer warpgroup 和三个 consumer warpgroups，通过 shared memory、barrier 和 ping-pong buffer 交换数据。不同 consumer 分别推进修正 value、状态和输出依赖链，producer 负责异步搬运与矩阵运算发射；这不是任意线程划分，而是直接对应 $V'\to S/O$ 的公式依赖。
+
+### 6.3 哪些结论是通用的，哪些只属于 Blackwell
+
+以下设计在 Hopper 和 Blackwell 实现中共享：
+
+- gate-free $A_0$ 与 fused state/output 的 kernel 边界。
+- optional CP preprocessing。
+- producer/consumer warp specialization 和片上流水。
+
+`tcgen05`、TMEM 以及具体 warpgroup/线程布局属于 SM100 Blackwell 实现细节；Hopper SM90 使用对应架构可用的 MMA 和片上存储机制。当前 FlashQLA 仓库支持多个 SM 版本，但不能把某个 Blackwell 文件中的指令级实现直接当成所有架构的统一实现。
+
+## 7. 与给定 Qwen config 的 shape 对应
+
+给定配置中：
+
+```text
+linear_num_key_heads   = 16
+linear_key_head_dim    = 128
+linear_num_value_heads = 128
+linear_value_head_dim  = 128
+```
+
+所以全局 GDN shape 为：
+
+| 张量 | 逻辑 shape | $C=64$ 时每个 chunk/head 相关大小 |
+| --- | --- | --- |
+| $Q,K$ | `[B,T,16,128]` | 每个 QK head 的 $K$ 为 `[64,128]` |
+| $V,O$ | `[B,T,128,128]` | 每个 value head 的 $V$ 为 `[64,128]` |
+| $\gamma,\beta$ | `[B,T,128]` | 每个 chunk 为 `[64,128]` |
+| $A_0$ | packed `[B,T,128,64]` | 等价于每个 chunk `[128,64,64]`，bf16 约 1 MiB |
+| initial/final state | `[N,128,128,128]` | fp32 为 8 MiB/sequence/layer |
+| CP segment state | `[num_segments,128,128,128]` | 每个 segment 一份入口状态 |
+| fallback $M$ | 每个 fallback head `[128,128]` | fp32 为 64 KiB/head/segment |
+
+这里采用 GVA，$H_v/H_{qk}=128/16=8$：每个 QK head 被 8 个 value/state heads 复用。$K$ 可以复用，但每个 value head 有自己独立的 $\beta$、$\gamma$ 和状态，因此 `kkt_solve` 最终仍需形成 128 份逻辑上的 $A_0$，不能只求 16 份后无条件广播。
+
+TP 会进一步减少每张 GPU 的本地 head 数。例如均匀 TP8 后，本地约为 2 个 QK heads 和 16 个 value heads；此时 batch 1 的普通 fused grid 很容易并行度不足，而长序列又提供了很多 chunk，所以正是 intra-card Auto-CP 更容易获益的 shape。与此同时，$A_0$ 每个全局 chunk 约 1 MiB，说明 FlashQLA 虽然保留了 solve 输出的 HBM 接口，但消除了更大的 $W/U/V'$ 和 boundary-state 中间流量。
+
+## 8. 反向为什么也影响前向的 kernel 边界
+
+FlashQLA 不仅优化前向。训练反向会复用 CP preprocessing 重算所需的 chunk boundary state，并把原本分散的 `bwd_dv`、`bwd_dhu`、`bwd_dqkwg` 和 `bwd_wy` 等阶段融合。$A_0$ 作为前向输出保留，也为反向提供了可复用的三角求解结果。
+
+这解释了为什么 FlashQLA 没有追求把前向全部塞进一个 kernel：独立的 $A_0$、明确的 CP 插入点和可重算的 boundary state 同时服务前向并行度与训练反向。本文不展开梯度公式，因为它们不改变 GDN 的前向算法。
+
+## 9. 算法演化与近似边界总结
 
 | 阶段 | 从 GDN 公式做了什么 | 优化目标 | 是否近似 |
 | --- | --- | --- | --- |
-| chunk-local cumsum | 将逐 token $\log\alpha$ 变为 $\gamma$ 和 pairwise decay $G$ | 批量生成 chunk 内衰减 | 否 |
-| gate-free $A_0$ | 用 $A=G\odot A_0$ 将 gate 从三角求逆移到消费侧 | 减少 solve 的指数与输入依赖 | 否 |
-| 独立 `kkt_solve` | 对所有 `(chunk,head)` 并行求 $A_0$ | 使用适合三角逆的独立 grid | 否 |
-| `fused_gdr_fwd` | 片上形成 $R,V_d$，同时计算 state update 与 output | 消除 $W/U/V_d/H$ 的 HBM 接口 | 否 |
-| Auto-CP fast-decay | 只重放达到 decay 阈值所需的 suffix chunk | 缩短长序列状态依赖 | 是，误差受累计 gate 衰减约束 |
-| Auto-CP fallback | 对慢衰减 head 保存并应用完整 $(M,N)$ | 不可安全截断时传递完整历史 | 否 |
+| 精确 chunk GDN | 将逐 token recurrence 化为三角求解和矩阵乘 | chunk 内并行 | 否 |
+| gate-free $A_0$ | 用 $A_g=\Gamma\odot A_0$ 将 gate 移出三角求逆 | 减少 solve 输入与指数计算 | 否 |
+| 独立 `kkt_solve` | 对全部 `(chunk,head)` 并行求 $A_0$ | 使用适合三角逆的独立 grid | 否 |
+| `fused_gdr_fwd` | 片上生成 $R/V'$，同时完成 state update 和 output | 消除 $W/U/V'$ 等 HBM 中间量 | 否 |
+| Exact CP | 用完整 $(M,N)$ 生成所有 segment 入口状态 | 将长状态链拆成并行 segment | 否 |
+| Auto-CP fast-decay | 从零状态重放达到阈值所需的有限 suffix | 避免计算完整 $M$ | 是；相对状态误差受累计 gate 约束 |
+| Auto-CP fallback | 对慢衰减 head 计算并组合完整 $(M,N)$ | 无法安全截断时保留完整历史 | 否 |
 
-因此 FlashQLA 的普通路径首先是一个精确、训练友好的 fused GDN 实现；gate-driven Auto-CP 才是在低并行度长序列场景中额外加入的算法级调优。
+完整演化链路是：
+
+```text
+逐 token GDN
+  -> 精确 chunk GDN
+  -> 发现多 kernel HBM 流量大
+  -> 全融合又受 chunk 状态链和 CTA 数限制
+  -> 用 A_g = Gamma * A0 重排公式并选择两段式融合
+  -> 需要并行度时插入 Exact CP
+  -> fast-decay head 用有限 warmup 省掉 M
+  -> slow-decay head 保留完整 M 精确修正
+```
+
+因此，FlashQLA 的普通路径和 Exact CP 路径都与 GDN 严格等价；只有 Auto-CP 对 fast-decay head 的有限 warmup 在算法上截断了历史。这个截断有 gate 衰减界，并在官方实测中通常落入数值噪声范围，但仍应与严格精确路径明确区分。
 
 ## 源码地图
 
-| 公式部分              | 路径/符号                                          |
-| --------------------- | -------------------------------------------------- |
-| orchestration         | `flash_qla/ops/gated_delta_rule/chunk/__init__.py` |
-| gate-free $A_0$       | `chunk/blackwell/kkt_solve.py`                     |
-| $V_d,S_{next},O$      | `chunk/blackwell/fused_fwd.py`                     |
-| segment local $(M,N)$ | `chunk/blackwell/prepare_h.py`                     |
-| warmup 与 correction  | `chunk/blackwell/cp_fwd.py`                        |
-| CP 切段 heuristic     | `chunk/cp_context.py`                              |
+| 公式部分 | 路径/符号 |
+| --- | --- |
+| orchestration | `flash_qla/ops/gated_delta_rule/chunk/__init__.py` |
+| gate-free $A_0$ | `chunk/blackwell/kkt_solve.py` |
+| $V',S_{i+1},O$ | `chunk/blackwell/fused_fwd.py` |
+| segment local $(M,N)$ | `chunk/blackwell/prepare_h.py` |
+| warmup 与入口状态 correction | `chunk/blackwell/cp_fwd.py` |
+| CP 切段 heuristic | `chunk/cp_context.py` |
+
+## 参考资料
+
+- [Qwen：FlashQLA: CP-/Bwd-Friendly Fused Linear Attention Kernels for GDN](https://qwen.ai/blog?id=flashqla)
+- [QwenLM/FlashQLA](https://github.com/QwenLM/FlashQLA)
