@@ -26,6 +26,60 @@ fused_gdr_fwd(q, k, v, A0, gamma, beta, state) -> O, final_state
 
 因此正常路径的数学主体是“gate cumsum + gate-free KKT/solve + fused state/output”三段，而不是把三角求逆也塞进主 fused kernel。
 
+### 1.1 普通路径的数据如何流动
+
+```text
+Q, K ------------------------------> optional L2 norm
+log(alpha) ------------------------> chunk_local_cumsum -> gamma [HBM]
+K, beta ---------------------------> kkt_solve          -> A0 [HBM]
+
+initial_state S0
+   + Q, K, V, gamma, beta, A0 -----> fused_gdr_fwd
+                                      for chunk c = 0..N-1:
+                                        P = Q K^T
+                                        U = K S_c
+                                        R = V - exp(gamma) U
+                                        V_d = (G * A0) diag(beta) R
+                                        O_c = cross-state output + local output
+                                        S_(c+1) = decayed S_c + K^T V_d
+                                      -> O [HBM]
+                                      -> final_state [optional HBM]
+```
+
+`kkt_solve` 对所有 `(chunk,state-head)` 并行，产生 gate-free $A_0$；`fused_gdr_fwd` 再按 `(sequence,state-head,value-tile)` 启动 CTA，每个 CTA 把 state tile 留在片上并串行消费多个 chunk。跨 kernel 必须物化的主要中间量只有 $\gamma$ 和 $A_0$，而 $R,V_d$、boundary state 与 output partial 不落 HBM。
+
+### 1.2 Auto-CP 路径的数据如何流动
+
+auto-CP 启用时，$\gamma$ 和 $A_0$ 仍先按普通路径生成；随后 preprocessing 把原 sequence 切成 segment，并为每段准备入口状态：
+
+```text
+gamma + segment boundaries ------------> warmup chunk count / fallback mask
+K, V, A0, gamma, beta + zero state -----> suffix state; fallback heads get full N
+slow-decay fallback heads --------------> full local transition M
+local state, optional M, raw initial_state -> correct_initial_states
+                                           -> initial_state[segment]
+
+Q, K, V, A0, gamma, beta
+   + initial_state[segment] --------------> fused_gdr_fwd over all segments in parallel
+                                           -> token O + original sequence final_state
+```
+
+快衰减 head 的 segment initial state 来自有限 suffix warmup，是带 $e^{-10}$ 绝对衰减界的近似；慢衰减 head 使用完整 $M$ 沿 segment 修正，保持精确历史。preprocess 只改变传给 `fused_gdr_fwd` 的 `initial_state`、`cu_seqlens` 和 sequence mapping，不改变 token 的 q/k/v 排列或最终 output 顺序。
+
+### 1.3 各阶段 shape
+
+| 张量 | 逻辑 shape | 给定 Qwen 配置、$C=64$ 时的大小 |
+| --- | --- | --- |
+| $Q,K$ | `[B,T,Hqk,K]` | `[B,T,16,128]` |
+| $V,O$ | `[B,T,Hv,V]` | `[B,T,128,128]` |
+| $\gamma,\beta$ | `[B,T,Hv]` | 每个 chunk 各 `[64,128]` |
+| $A_0$ | `[B,T,Hv,C]` | 每个 chunk `[128,64,64]`，bf16 为 1 MiB |
+| ordinary initial/final state | `[N,Hv,K,V]` | fp32 为 8 MiB/sequence/layer |
+| CP segment initial state | `[num_segments,Hv,K,V]` | 每段一份入口 state |
+| fallback $M$ | 概念上 `[num_segments,Hv,K,K]` | 只为慢衰减 head 参与精确修正 |
+
+与 FLA 相比，FlashQLA 每个 chunk 仍要把 1 MiB 的 $A_0$ 写到 HBM 再由 fused kernel 读取，但省去了每 chunk 约 2 MiB 的 $W$、2 MiB 的 $U$、2 MiB 的 $V_{new}$ 和 4 MiB 的 boundary state。与 FlashInfer non-CP 相比，它保留了独立 $A_0$ 边界，以换取完全并行的求逆 grid、训练 backward 检查点和较低的主 kernel 资源压力。
+
 ## 2. 从公式看 FlashQLA 优化了什么
 
 算法文档给出的 gated triangular inverse 是

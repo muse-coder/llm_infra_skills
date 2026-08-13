@@ -69,26 +69,54 @@ $$
 
 所以 FLA 的首要优化角度不是把所有公式塞进一个 kernel，而是保留可复用的 WY 分解和训练反向边界，同时在最昂贵的局部步骤上做针对性融合。它获得通用性与完整 autograd，代价是 $A/W/U/H/V_{new}$ 等中间量的 HBM 流量。
 
-## 3. 前向 kernel 链
+## 3. FLA 前向的端到端数据流
 
-FLA 原生 Triton 路径的主线是：
+FLA 从模型层接收 q/k/v、raw gate 或 $\log\alpha$、raw beta 或 $\beta$、入口状态和 sequence metadata。完整前向链为：
 
 ```text
-gate/log-decay
-  └─ chunk-local cumsum
+Q, K -----------------------> optional L2 norm --------------------> Qn, Kn
+raw a, A_log, dt_bias ------> log(alpha) ----+
+log(alpha) ----------------------------------+-> chunk cumsum -----> gamma(log2)
+raw b ---------------------------------------> optional sigmoid ----> beta
 
-K, beta, cumulative g
-  └─ KKT + triangular solve -> A
-  └─ recompute_w_u          -> W, U
+Kn, beta, gamma -----------------------------> KKT + solve ---------> A
+A, beta, V ----------------------------------> WY value branch ------> U
+A, beta, gamma, Kn --------------------------> WY key branch --------> W
 
-K, W, U, g, initial_state
-  └─ chunk state scan       -> boundary states H, V_new, final_state
+initial_state S0
+   + Kn, W, U, gamma ------------------------> serial state scan
+                                                ├─ H[c] = S_c
+                                                ├─ V_new[c] = U[c] - W[c] S_c
+                                                └─ final_state
 
-Q, K, V_new, H, g
-  └─ output kernel          -> O
+Qn, Kn, gamma, H[c], V_new[c] --------------> parallel output ------> O
 ```
 
-若打开 q/k norm 或 beta sigmoid，前面还会有对应 kernel。核心不是固定“恰好几个 launch”，而是三个明确边界：intra-chunk WY 表示、chunk 间状态递推、输出组装。
+前半段的 cumsum、KKT/solve 和 WY 对所有 chunk 并行；state scan 沿 sequence 的 chunk 方向串行，产生每个 chunk 的入口状态；output 阶段再把所有 chunk 展开并行。FLA 用 HBM 中间张量把这三种不同 grid 连接起来。
+
+### 3.1 各阶段 shape
+
+令 $N_T=\lceil T/C\rceil$；varlen 时用所有 sequence 的实际 chunk 总数代替 $B\times N_T$。主要张量的逻辑 shape 为：
+
+| 张量 | shape | 给定 Qwen 配置、$C=64$ 时的含义 |
+| --- | --- | --- |
+| $Q,K$ | `[B,T,Hqk,K]` | `[B,T,16,128]`；若 integration 先展开 GVA，则 head 维为 128 |
+| $V,U,V_{new},O$ | `[B,T,Hv,V]` | `[B,T,128,128]` |
+| $\gamma,\beta$ | `[B,T,Hv]` | `[B,T,128]` |
+| $A$ | `[B,T,Hv,C]` | 每个 chunk 等价于 `[Hv,64,64]`，bf16 为 1 MiB |
+| $W$ | `[B,T,Hv,K]` | 每个 chunk `[64,128,128]`，bf16 为 2 MiB |
+| $H$ | `[B,NT,Hv,K,V]` | 每个 boundary 为完整 state；给定配置下 bf16 为 4 MiB |
+| final state | `[N,Hv,K,V]` | 给定配置下 fp32 为 8 MiB/sequence/layer |
+
+### 3.2 哪些数据真正跨 kernel
+
+`chunk_gated_delta_rule_fwd_intra` 把 $A,W,U$ 写入 HBM；state kernel 读 $W/U$，再写 $H$ 和 $V_{new}$；output kernel 读 $H/V_{new}$ 并写 $O$。因此数据流中的全局物化边界是
+
+```text
+gamma -> A/W/U -> H/V_new -> O
+```
+
+这些中间量不是 GDN 数学要求，而是 FLA 为训练反向、通用 shape 和简单 kernel grid 选择的接口。在给定 Qwen shape 下，每个 chunk 的 $A+W+U+V_{new}+H$ 约为 $1+2+2+2+4=11$ MiB bf16 中间数据；其中还没有计入读取次数。它解释了为什么 FLA 的训练结构清晰，但纯推理的 HBM 压力高于 fused 版本。
 
 ## 4. Gate cumsum
 
