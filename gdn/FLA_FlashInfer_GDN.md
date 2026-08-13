@@ -76,38 +76,107 @@ $$
 
 把包含 $r_1$ 的项移到左边，就是一个 $2\times2$ 单位下三角方程；一般的 $C$ 只是扩展为 $C\times C$。
 
-### 1.3 一次下三角求解得到所有 residual
+### 1.3 串行 residual 循环就是下三角前代
 
-将 $r_i^\top$ 堆成 $R\in\mathbb{R}^{C\times d_v}$ 的第 $i$ 行，上式变为
+将 $r_i^\top$ 堆成 $R\in\mathbb{R}^{C\times d_v}$ 的第 $i$ 行，并定义
 
 $$
-\left[I+\operatorname{strictLower}
-\left(G\odot\operatorname{diag}(\beta)KK^\top\right)\right]R
-=\operatorname{diag}(\beta)
-\left(V-\operatorname{diag}(e^\gamma)KS_0\right).
+L=\operatorname{strictLower}
+\left(G\odot\operatorname{diag}(\beta)KK^\top\right),
 $$
+
+$$
+B=\operatorname{diag}(\beta)
+\left(V-\operatorname{diag}(e^\gamma)KS_0\right),
+$$
+
+则所有 residual 满足
+
+$$
+\boxed{(I+L)R=B}.
+$$
+
+例如 $C=4$ 时，这个方程就是
+
+$$
+\begin{bmatrix}
+1&0&0&0\\
+L_{21}&1&0&0\\
+L_{31}&L_{32}&1&0\\
+L_{41}&L_{42}&L_{43}&1
+\end{bmatrix}
+\begin{bmatrix}
+r_1^\top\\r_2^\top\\r_3^\top\\r_4^\top
+\end{bmatrix}
+=
+\begin{bmatrix}
+B_1\\B_2\\B_3\\B_4
+\end{bmatrix}.
+$$
+
+逐行展开恰好得到
+
+$$
+r_i^\top=B_i-\sum_{j<i}L_{ij}r_j^\top.
+$$
+
+这就是原来的逐 token residual 递推，也就是单位下三角系统的串行前代。公式转换没有消除因果性，只是把“隐藏在 Python/CUDA 循环里的依赖”显式放进矩阵 $L$ 的严格下三角区域。
+
+### 1.4 Chunk 并行究竟并行在哪里
 
 定义
 
 $$
+\boxed{A=(I+L)^{-1}},
+$$
+
+就有
+
+$$
 \boxed{
-A=\left[I+\operatorname{strictLower}
-\left(G\odot\operatorname{diag}(\beta)KK^\top\right)\right]^{-1}
-},
+V_{new}=R=AB
+=A\operatorname{diag}(\beta)
+\left(V-\operatorname{diag}(e^\gamma)KS_0\right)
+}.
+$$
+
+`V_new` 不是新的模型投影，而是逐 token residual $r_1,\ldots,r_C$ 的堆叠。这里的“chunk 并行”包含三层含义：
+
+1. $KK^\top$、所有 $G_{ij}$ 和右端项 $B$ 可以对整个 chunk 用 GEMM/向量算子并行构造，不再逐 token 发射矩阵-向量算子。
+2. 下三角求解仍有因果依赖，但可以分块。先在较小对角块内做短前代，再用矩阵乘合并各块；FLA 和 FlashInfer 的 $C=64$ 快路径都把 64 步长依赖改成小块求解与分层矩阵乘。
+3. 得到 $V_{new}$ 后，整个 chunk 的 state update 和所有 token output 都变成矩阵乘，可以同时利用 Tensor Core。
+
+以两个对角块为例，令 $T=I+L$，并写成
+
+$$
+T=
+\begin{bmatrix}
+T_{00}&0\\
+T_{10}&T_{11}
+\end{bmatrix},
 $$
 
 则
 
 $$
-\boxed{
-V_{new}=R=A\operatorname{diag}(\beta)
-\left(V-\operatorname{diag}(e^\gamma)KS_0\right)
-}.
+T^{-1}=
+\begin{bmatrix}
+T_{00}^{-1}&0\\
+-T_{11}^{-1}T_{10}T_{00}^{-1}&T_{11}^{-1}
+\end{bmatrix}.
 $$
 
-`V_new` 不是新的模型投影，而是逐 token residual $r_1,\ldots,r_C$ 的堆叠。下三角求解只是一次得到这些因果 residual，数学上与按顺序计算完全等价。
+两个对角块的局部逆可以独立处理，块间影响通过矩阵乘 $-T_{11}^{-1}T_{10}T_{00}^{-1}$ 合并。继续递归合并，就得到 $16\to32\to64$ 一类实现。它缩短了串行链并把大量工作转给 Tensor Core，但三角求解本身并没有变成完全无依赖的逐元素并行。
 
-### 1.4 展开 state update 和 output
+| 逐 token 写法 | chunk 写法 | 并行性的变化 |
+| --- | --- | --- |
+| 每步计算 $k_i^\top S$ | 一次计算 $KS_0$ | GEMV 变 GEMM |
+| 每步计算所有 $k_i^\top k_j$ | 一次计算 $KK^\top$ | pairwise 系数并行生成 |
+| 按 $i$ 更新 $r_i$ | 分块求解 $(I+L)R=B$ | 长前代变短前代与块 GEMM |
+| 每步 rank-1 更新 state | 一次计算 $K^\top V_{new}$ | rank-1 update 变 GEMM |
+| 每步读取输出 | $QS_0+(QK^\top)V_{new}$ | 所有 query 一起计算 |
+
+### 1.5 展开 state update 和 output
 
 求得全部 $V_{new}$ 后，chunk 结束状态为
 
@@ -131,7 +200,7 @@ $$
 
 第一项读取衰减后的入口状态，第二项读取当前 chunk 已发生的 residual 写入。`Lower` 包含对角线，对应逐 token GDN 中先更新 $S_i$、再计算 $o_i$。
 
-### 1.5 Chunk 内并行，chunk 间仍然串行
+### 1.6 Chunk 内并行，chunk 间仍然串行
 
 精确 chunk GDN 的数据流是：
 
@@ -142,13 +211,47 @@ K, V, S_c, A -> residual writes V_new -------------+-> S_(c+1)
 Q, K, V_new, S_c -----------------------------------+-> O_c
 ```
 
-$KK^\top$、$KS_c$、$QK^\top$、$QS_c$ 和 $K^\top V_{new}$ 都能转换为矩阵乘；token 因果性被编码进 $A$。但是不同 chunk 仍满足
+$KK^\top$、$KS_c$、$QK^\top$、$QS_c$ 和 $K^\top V_{new}$ 都能转换为矩阵乘；chunk 内 token 的因果性被编码进下三角矩阵 $A$。但是不同 chunk 仍满足
 
 $$
 S_{c+1}=F_c(S_c),
 $$
 
-所以默认执行必须先得到 $S_c$，才能处理下一个 chunk。这是后面 state 驻留、kernel 融合和精确 CP 要优化的共同瓶颈。
+所以默认执行必须先得到 $S_c$，才能处理下一个 chunk。换句话说，chunk GDN 只把长度为 $C$ 的 token 依赖压缩成一次 chunk 变换，没有自动并行整个 sequence。
+
+对固定的 $K,V,\alpha,\beta$，每个 chunk 还可以写成入口状态的仿射映射
+
+$$
+S_{c+1}=M_cS_c+N_c.
+$$
+
+若显式计算每段的 $(M_c,N_c)$，就能用 associative scan 或 segment fixup 并行更长的状态链；FlashInfer 精确 CP 使用的正是这条路线。代价是 $M_c\in\mathbb{R}^{d_k\times d_k}$ 的计算、存储和复合，所以普通 FLA/FlashInfer non-CP 路径选择保留 chunk 间串行，只在并行度确实不足时支付 CP 代价。
+
+### 1.7 Chunk size 可以无限扩大吗
+
+从纯数学正确性看，$C$ 可以从 1 取到整条序列长度 $T$：$C=1$ 就是逐 token GDN，$C=T$ 则把整条序列写成一个巨大的下三角系统。但工程上不能随着序列无限增大 $C$；GDN 能处理长序列，依靠的是“固定小 chunk + 固定大小 recurrent state”，而不是让 chunk 本身随 $T$ 增长。
+
+令 chunk 数 $N_c\approx T/C$。忽略 batch 和 head 后，主要开销随 $C$ 的变化为：
+
+| 项目 | 每个 chunk | 整条长度 $T$ | $C$ 变大后的结果 |
+| --- | --- | --- | --- |
+| $KK^\top$、$QK^\top$、$A$ 作用到 value | $O(C^2(d_k+d_v))$ | $O(TC(d_k+d_v))$ | 线性增加 |
+| 显式/分块构造 $A=(I+L)^{-1}$ | 最坏 $O(C^3)$ | $O(TC^2)$ | 增长更快 |
+| recurrent state 相关 GEMM | $O(Cd_kd_v)$ | $O(Td_kd_v)$ | 总量基本不变 |
+| $A$、score 等 chunk-local tile | $O(C^2)$ | 可逐 chunk 复用 | 片上容量压力平方增长 |
+| boundary state 数量 | 每 chunk 一份或片上流过 | $O(T/C)$ | 数量减少 |
+
+若某个实现直接求解 $(I+L)R=B$ 而不显式构造完整 $A$，可以避免单独的 $O(C^3)$ 求逆；但 $KK^\top/QK^\top$ 和多右端三角求解仍有 $C^2$ 级局部工作，因此 $C$ 随 $T$ 增长时仍会破坏整体线性复杂度。FLA 与本文分析的 FlashInfer 快路径为了复用和融合后续计算，会显式或分块构造 $A$。
+
+因此增大 $C$ 有收益：chunk 数量减少、boundary state/外层循环减少、矩阵乘 tile 更大；但超过硬件甜点后会出现五个问题：
+
+1. **局部计算失去线性复杂度。** 当 $C$ 是固定常数时，总计算量对 $T$ 仍近似线性；若令 $C=T$，$KK^\top/QK^\top$ 至少变成 $O(T^2)$，显式构造三角逆还可能达到 $O(T^3)$。
+2. **片上空间按 $C^2$ 增长。** $KK^\top$、$QK^\top$、$A$ 和 pairwise gate 都是 $C\times C$；过大后无法同时放入 register/SMEM/TMEM，只能降低 occupancy、切更多 tile，甚至溢出到 HBM。
+3. **三角依赖链变长。** 分块求逆能缩短依赖，但不能消除因果性；块数越多，合并层次、同步和 kernel latency 越大。
+4. **可调度的独立工作减少。** $T/C$ 越小，KKT/solve/output 等 state-independent 阶段可并行调度的 chunk program 越少；在 batch/head 数也小时，GPU 可能因为 CTA 不足而欠占用。
+5. **数值范围更困难。** 很长 chunk 的累计 gate 差会使远距离 $G_{ij}$ 下溢，单位下三角求解的舍入误差也会随依赖链累积。log-space gate 能缓解指数范围问题，但不能消除大三角系统的数值和精度代价。
+
+所以 chunk size 是 kernel tile 参数，不是越大越好的模型能力参数。本文对应实现把 $C=16/32/64$ 作为主要范围，FlashInfer 主快路径固定在 64；实际选择是在“更少的 chunk 边界”与“$C^2/C^3$ 局部代价、片上资源、occupancy”之间取平衡。序列可以远长于 64，因为 $S_{c+1}$ 会把完整历史继续传给下一个固定大小 chunk。
 
 ## 2. 同一组 chunk 公式，两种 kernel 边界
 
