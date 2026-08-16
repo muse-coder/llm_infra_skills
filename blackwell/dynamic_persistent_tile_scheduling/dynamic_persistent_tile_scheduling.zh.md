@@ -14,25 +14,61 @@ $$C = AB,$$
 
 $$C^{[i,j]} = \sum_k A^{[i,k]} B^{[k,j]}.$$
 
-每个 **work tile（工作块）** $C^{[i,j]}$ 都必须被分配给某个处理器——具体来说，是 CUDA 执行模型中的一个 CTA 或一个 CTA cluster。**tile 调度（tile scheduling）** 问题就是要确定如何把这一组 work tile 最优地分配到各处理器上。
+每个 **work tile（工作块）** $C^{[i,j]}$ 都必须被分配给一个 CTA，或者由一个 CTA cluster 协作处理。这里需要区分算法和硬件执行模型中的三个概念：
 
-本文讨论 **Cluster Launch Control**（CLC），这是 NVIDIA Blackwell GPU 上一项由硬件支持的特性，用于实现最优的 tile 调度，尤其是在**负载均衡（load balancing）**方面。为了给出背景，我们先回顾几种常见的调度策略，以及 CLC 所要解决的这些策略的不足。接着我们逐行讲解在 CuTe DSL kernel 中使用 CLC 的实现细节，最后以一个 GEMM kernel 的性能对比收尾。
+* work tile 是算法层面的数据和计算任务；
+* CTA（thread block）或 CTA cluster 是执行、协作与调度单位，并不是硬件处理器；
+* SM 才是实际执行 CTA 的硬件单元。一个 CTA 的线程在一个 SM 上执行；同一 cluster 中的 CTA 会在同一个 GPC 内协同调度。
+
+因此，**tile 调度（tile scheduling）** 问题是确定 work tile 如何分配给 CTA/cluster；CUDA 硬件调度器再决定这些 CTA/cluster 何时获得 SM 资源。程序通常不能提前指定某个 cluster 必须在哪一组 SM 上运行。
+
+还要区分“提交到 kernel grid 中的逻辑 cluster 数量”和“某一时刻实际驻留的 cluster 数量”。逻辑 grid 可以远大于 GPU 的并发容量；超过容量的 cluster 尚未执行，也没有占用 SM。能够同时驻留多少 cluster 取决于 SM 数量、cluster shape、寄存器、shared memory 和线程数等资源。为了便于讨论，本文后面把同一时刻能够并发驻留的一批 CTA/cluster 称为一个 **wave（波次）**。
+
+如果 cluster 含有多个 CTA，那么一个 cluster 级的工作分配实际上对应一组 CTA-level 输出 tile。除非需要区分这两个层次，下文仍简称为一个 work tile。
+
+本文讨论 **Cluster Launch Control**（CLC），这是 NVIDIA Blackwell GPU 上一项由硬件支持的特性，用于实现高效的动态 tile 调度，尤其改善**负载均衡（load balancing）**。CLC 并不保证对所有问题都优于静态调度，具体选择仍然取决于 workload 和数据局部性。为了给出背景，我们先回顾几种常见的调度策略，以及 CLC 所要解决的这些策略的不足。接着我们逐行讲解在 CuTe DSL kernel 中使用 CLC 的实现细节，最后以一个 GEMM kernel 的性能对比收尾。
 
 ### 单 tile 调度（Single Tile Scheduling）
 
-最朴素的 tile 调度选择，是启动一个形状为 (M/bM, N/bN) 的 cluster 网格，并把每个 work tile 分配给唯一的一个 cluster。这对负载均衡是有利的：网格中的 cluster 数量多于 SM 组的数量，因此每当一个 cluster 退出时，硬件调度器就会把一个排队中的 cluster 派发到刚空闲下来的 SM 组上。然而，这种策略整体上往往并不是最优的，因为每个 cluster 都要付出固定的启动开销——流水线初始化、descriptor 设置等等——而这些开销只被摊销到单个 tile 上。此外，采用单 tile 调度时，我们无法在多个 work tile 之间做重叠来隐藏延迟，例如把一个 work tile 的 epilogue 与另一个 work tile 的 mainloop 重叠。
+最朴素的选择是提交覆盖完整问题的 grid，并把每个 work tile 分配给唯一的一个逻辑 cluster。假设问题有 512 个 cluster-level work tile，而 GPU 最多并发驻留 74 个这种 cluster，那么 kernel grid 中有 512 个逻辑 cluster，但第一波最多只有 74 个真正开始执行，其余 cluster 在硬件调度队列中等待资源。
+
+每个 cluster 只完成自己的一个 work tile：初始化流水线和 descriptor，执行 mainloop 和 epilogue，然后退出。某个 cluster 退出并释放 SM 资源后，硬件调度器再从尚未启动的 cluster 中选择一个进行派发。这里启动的是一个新的 cluster 实例，并不是刚退出的 cluster 继续处理下一个任务；这些派发都属于同一次 CUDA kernel launch，也不是 host 再次启动 kernel。等待中的 cluster 也没有预先绑定到某个 SM 的专属队列。
+
+在理想化的并发容量为 74 的情况下，512 个 cluster 大约形成
+
+$$
+\left\lceil \frac{512}{74} \right\rceil = 7
+$$
+
+个 wave。最后一个 wave 通常无法填满全部 SM，这种由任务数量不能整除并发容量造成的尾部空闲称为 **wave quantization（波次量化）**。即使所有 tile 的耗时完全相同，它也会出现，因此它与“不同 tile 耗时不同”造成的负载不均衡不是同一个概念。
+
+单 tile 调度的优点是硬件会自然地把尚未启动的 cluster 派发给先空闲的资源，所以对 tile 执行时间波动具有良好的负载均衡能力，也保留了为其他 kernel 让出资源的灵活性。缺点是每个 cluster 都要付出固定的初始化和退出开销，而这些开销只被摊销到单个 tile 上。此外，不同 cluster 之间无法直接把一个 tile 的 epilogue 与另一个 tile 的 mainloop 重叠。
 
 ### 静态持久化 tile 调度（Static Persistent Tile Scheduling）
 
 另一方面，我们也可以选择采用持久化（persistent）的 tile 调度方案。这里我们简要回顾一下持久化 tile 调度的概念，更详细的阐述请读者参阅我们的[前一篇文章](https://research.colfax-intl.com/cutlass-tutorial-persistent-kernels-and-stream-k/)。
 
-在持久化的设定下，我们启动的网格所包含的 cluster 数量，等于 GPU 上能够并发调度的 cluster 数量。此时，一旦某个 cluster 被启动，它就会“持久地（persist）”驻留在 GPU 上，计算某一组 work tile。例如，给定 148 个 SM、cluster 大小为 2，我们就可以在 GPU 上并发启动 74 个 cluster。如果我们启动一个包含 512 个 work tile 的 GEMM kernel，那么我们可以为这些 work tile 选定某种线性顺序，让每个 cluster 计算其中每隔 74 个的那一个 work tile。
+在静态持久化的设定下，我们不再为每个 work tile 分别提交一个 cluster，而是只启动一组 **worker cluster**。worker 数量通常取该 kernel 在空闲 GPU 上理论可同时驻留的 cluster 数量，并受问题总 tile 数量限制。这个理论值可以在 launch 前根据设备属性和 kernel 的资源占用计算；它是 occupancy 上限，并不保证 kernel 实际运行时所有 worker 都能立刻获得资源。例如，其他并发 kernel 可能占用部分 SM。
+
+一旦某个 worker cluster 开始运行，它就会“持久地（persist）”驻留在分配给它的硬件资源上，在 kernel 内部的循环中连续计算多个 work tile，直到自己的静态任务序列耗尽才退出。假设总共有 $T=512$ 个 work tile，并启动 $W=74$ 个 worker，那么编号为 $w$ 的 worker 可以处理
+
+$$
+w,\; w+W,\; w+2W,\; \dots < T.
+$$
+
+也就是说，worker 0 处理 tile 0、74、148……，worker 1 处理 tile 1、75、149……。此时 grid 中只有 74 个 worker cluster；其余 438 个 tile 只是任务编号，并不存在与它们一一对应、等待启动的 cluster 实例。
+
+例如，给定 148 个 SM、cluster 大小为 2，并且这个 GEMM 的资源占用使每个 SM 同时只能承载一个相关 CTA，我们可以在空闲 GPU 上并发驻留 74 个 cluster。这里的 74 是这个特定配置的 occupancy 结果，不是“cluster 数量永远等于 SM 数除以 cluster size”的通用规则：如果一个 SM 可以同时驻留多个 CTA，并发 cluster 数也会相应变化。
 
 ![GEMM 的输出 C 被切分为 5 × 6 的 work tile 网格，每个 tile 由八个 cluster 之一计算；分配给 cluster 0 的 tile 被高亮标出](images/fig01_static_persistent_partition.png)
 
 *图 1：GEMM 的输出 C 被切分成 5 × 6 的 work tile 网格，每个 tile 都由八个 cluster 之一来计算。每个 work tile 都标注了分配给它的 cluster 编号。分配给 cluster 0 的 work tile 被高亮显示。*
 
-持久化 tile 调度的主要好处在于，我们可以把一个 tile 的 epilogue 与下一个 tile 的 mainloop 重叠；同时我们也避免了启动新 cluster 的延迟。然而，静态持久化 tile 调度会带来负载不均衡的问题。例如，考虑一个 grouped GEMM，它计算一组 GEMM：
+持久化 tile 调度的主要好处在于，流水线和部分状态可以在多个 tile 之间复用，固定初始化成本被多个 tile 摊销；kernel 还可以把一个 tile 的 epilogue 与下一个 tile 的 mainloop 重叠。切换 work tile 仍然需要更新 tile 坐标和 pipeline state，但不需要退出当前 cluster 再派发一个新的 cluster。
+
+静态持久化的代价是任务所有权已经固定。即使某个 worker 提前完成自己的全部 tile，它也不能帮助仍在执行慢 tile 的 worker。如果 launch 前按理论 occupancy 选择了 74 个 worker，而运行时只有 50 个能够立刻驻留，那么其余 24 个 worker 及其静态任务序列只能等待；已经运行的 50 个 worker 不会接管它们的任务。正确性不受影响，因为等待中的 worker 最终仍会启动，但性能和资源利用率可能变差。
+
+即使所有 worker 都成功驻留，不同 tile 的计算量也可能造成负载不均衡。例如，考虑一个 grouped GEMM，它计算一组 GEMM：
 
 $$C_i = A_i B_i, \quad i = 0, 1, \dots, \texttt{num\_problems} - 1.$$
 
@@ -73,13 +109,27 @@ $$2 * \text{bM} * \text{bN} * K = 2 * 2^7 * 2^7 * 2^{11} = 2^{26} \text{ FLOPs}.
 
 ### 动态持久化 tile 调度（Dynamic Persistent Tile Scheduling）
 
-在这种调度方案中，每个 cluster 会先计算某个初始 work tile，然后只要还有可用的 work tile，就继续获取并处理新的 work tile。让我们看看这如何避免前面例子中出现的负载不均衡。在一个合理的假设下——即 cluster 处理来自问题 0 或 2 的 tile 所需的时间，远小于处理来自问题 1 或 3 的 tile 所需的时间——work tile 到 cluster 的分配可能会呈现如下形态：
+动态持久化和静态持久化一样，也允许一个已经驻留的 worker cluster 连续处理多个 work tile。二者的关键区别并不是“是否处理多个 tile”，而是下一个 tile 的所有权何时决定：静态调度在执行前就为每个 worker 固定完整任务序列；动态调度只给出初始任务，之后由先完成当前 tile 的 worker 在运行时领取剩余任务。
+
+这里“完成当前 tile”不等于 cluster 已经退出。worker 仍然处在 kernel 的 persistent loop 中，只有这样才能领取下一个 work；真正退出的 CTA/cluster 不能再执行 steal。
+
+动态持久化是一种调度策略，并不规定唯一的 grid 形状。使用全局原子计数器的传统实现通常只启动与理论并发容量相当的 worker 数量，然后让它们从软件工作队列领取 tile；Blackwell CLC 实现则提交与 single-tile 调度相同的完整逻辑 grid，再让已经实际启动的 cluster 取消尚未启动的 cluster，并接管其坐标所代表的工作。后文将详细解释这一区别。
+
+让我们看看动态分配如何避免前面例子中的负载不均衡。在一个合理的假设下——即 cluster 处理来自问题 0 或 2 的 tile 所需的时间，远小于处理来自问题 1 或 3 的 tile 所需的时间——work tile 到 cluster 的分配可能会呈现如下形态：
 
 ![在动态持久化情形下，每个 cluster 先拿到一个初始 tile，随后在完成当前工作时再去获取新的 tile](images/fig04_dynamic_assignment.png)
 
 *图 4：我们的 grouped GEMM 中的每个 work tile 都被分配给八个 cluster 之一。在动态持久化的情形下，分配方式是：把所有问题的 work tile 线性排序，给每个 cluster 分配一个初始 work tile，然后允许各 cluster 在完成当前工作后再去获取新的 work tile。*
 
 注意，除了初始分配之外，程序员无法控制哪些 work tile 由哪些 cluster 来计算。这些分配是在运行时根据各 cluster 完成其工作的先后顺序来决定的。我们看到，在这种情形下，各 cluster 计算的 FLOP 数量分布得更加均匀。
+
+三种策略可以概括如下：
+
+| 调度策略 | 提交的逻辑 cluster 数量 | 一个实际启动的 cluster 处理多少 work | 下一个 work 如何决定 | 主要特点 |
+| --- | --- | --- | --- | --- |
+| 单 tile | 与完整问题的 cluster-level work 数量相当 | 一个 | 该 cluster 没有下一个 work；退出后由硬件派发新的 cluster | 自然负载均衡和抢占灵活性较好，但每个 tile 都重复承担 cluster 初始化成本 |
+| 静态持久化 | 通常取理论可并发驻留的 worker 数量 | 多个 | launch 前为每个 worker 固定任务序列 | 初始化成本被摊销，也便于跨 tile 重叠；但不能适应 tile 耗时差异或实际可用 SM 数量变化 |
+| 动态持久化 | 传统原子实现通常只提交少量 worker；CLC 提交完整逻辑 grid | 多个 | 完成当前 tile 后在运行时领取 | 兼顾持久化的摊销优势和动态负载均衡，但存在调度开销，并可能改变 cache locality |
 
 ![动态持久化情形下每个 cluster 所完成的工作（以计算的 FLOP 数量衡量），分布更加均匀](images/fig05_dynamic_flops.png)
 
@@ -117,7 +167,13 @@ $$2 * \text{bM} * \text{bN} * K = 2 * 2^7 * 2^7 * 2^{11} = 2^{26} \text{ FLOPs}.
 
 ## Blackwell 的 Cluster Launch Control（CLC）
 
-CLC 是从 Blackwell 架构开始提供的、由硬件支持的动态持久化 tile 调度版本。它最初提交的启动网格与单 tile 调度器的网格完全相同（即由问题的 work tile 数量决定——参见后文讲解中对 `_compute_grid` 的讨论），但第一波活跃的 cluster 会反复尝试“窃取（steal）”那些尚未启动的 cluster 的工作——取消它们的启动，取得它们的 tile 坐标，然后自行完成这些工作。因此，第一波 cluster 最终可能会持久驻留并完成所有工作，而网格中的其他 cluster 可能永远不会真正启动。另一方面，CLC 还具备灵活性：它可以动态地允许某些 cluster 在尚未完成所有 tile 的情况下退出，之后再启动新的 cluster 来继续处理这个问题（参见“CLC 与并发 kernel 及抢占”一节）。我们先考察与 CLC 相关的 PTX 指令，然后逐行讲解 NVIDIA 的 [CLC CuTeDSL 示例](https://github.com/NVIDIA/cutlass/blob/ae6bccf341fb4410241f696ba06873023d5ce4ed/examples/python/CuTeDSL/cute/blackwell/kernel/dense_gemm/dense_gemm_persistent_dynamic.py)，最后报告一个对比 CLC、静态持久化调度和单 tile 调度的实验。
+CLC 是从 Blackwell 架构开始提供的、由硬件支持的动态持久化 tile 调度实现。它最初提交的启动网格与单 tile 调度器的网格完全相同，即由问题的 work tile 数量决定，而不是由 SM 数量或理论 occupancy 决定——参见后文讲解中对 `_compute_grid` 的讨论。
+
+仍以 512 个 cluster-level work tile、最多并发驻留 74 个 cluster 为例：CLC 会在逻辑 grid 中提交 512 个 cluster，第一波最多只有 74 个实际开始执行，其余 cluster 仍处于尚未启动的状态。一个活跃 cluster 完成自己的初始 tile 后不会退出，而是继续留在 persistent loop 中发出 `try_cancel`。如果请求成功，硬件会原子地取消某个尚未执行的 cluster 的未来启动，并返回该 cluster 中第一个 CTA 的 grid 坐标。活跃 cluster 随后用这个坐标计算被接管的 tile，再继续尝试取消和接管其他工作。
+
+例如，为了说明流程，假设活跃的 cluster 0 得到了尚未启动的 cluster 74 的坐标：cluster 74 将永远不会真正开始执行，cluster 0 则在完成 tile 0 后继续计算 tile 74。这里没有杀死正在运行的 cluster，也不是 cluster 0 退出后重新启动；被取消的只是一个尚未产生执行副作用的未来派发。实际返回哪个可取消 cluster 由硬件在运行时决定，程序员不能依赖这个示例编号。
+
+因此，第一波 cluster 最终可能会持久驻留并完成所有工作，而网格中的其他 cluster 可能永远不会真正启动。另一方面，CLC 还具备灵活性：它可以动态地允许某些 cluster 在尚未完成所有 tile 的情况下退出，之后再启动新的 cluster 来继续处理这个问题（参见“CLC 与并发 kernel 及抢占”一节）。我们先考察与 CLC 相关的 PTX 指令，然后逐行讲解 NVIDIA 的 [CLC CuTeDSL 示例](https://github.com/NVIDIA/cutlass/blob/ae6bccf341fb4410241f696ba06873023d5ce4ed/examples/python/CuTeDSL/cute/blackwell/kernel/dense_gemm/dense_gemm_persistent_dynamic.py)，最后报告一个对比 CLC、静态持久化调度和单 tile 调度的实验。
 
 我们参考的资料包括以下几项：
 
