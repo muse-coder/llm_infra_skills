@@ -24,15 +24,37 @@ $$C^{[i,j]} = \sum_k A^{[i,k]} B^{[k,j]}.$$
 
 还要区分“提交到 kernel grid 中的逻辑 cluster 数量”和“某一时刻实际驻留的 cluster 数量”。逻辑 grid 可以远大于 GPU 的并发容量；超过容量的 cluster 尚未执行，也没有占用 SM。能够同时驻留多少 cluster 取决于 SM 数量、cluster shape、寄存器、shared memory 和线程数等资源。为了便于讨论，本文后面把同一时刻能够并发驻留的一批 CTA/cluster 称为一个 **wave（波次）**。
 
+CUDA kernel 的 `gridDim` 始终按 CTA/thread block 计数，而不是按 cluster 计数。若 cluster shape 为 $(c_x,c_y,c_z)$，每个 cluster 包含 $c_xc_yc_z$ 个 CTA；当 grid 各维度都能按 cluster shape 完整分组时，逻辑 cluster 数为
+
+$$
+N_{\mathrm{cluster}}=
+\frac{\mathrm{gridDim.x}}{c_x}
+\frac{\mathrm{gridDim.y}}{c_y}
+\frac{\mathrm{gridDim.z}}{c_z}.
+$$
+
+实际 launch 时 grid 必须满足完整 cluster 的对齐要求，本文后面的 CUTLASS 代码会把 grid 向上取整。一个 CTA 只在一个 SM 上执行，但一个 SM 在资源允许时可以同时驻留多个 CTA；同一 cluster 的所有 CTA 则必须在同一个 GPC 内协同驻留和调度。因此，“cluster grid 可以超过 SM 数量”在 CUDA 中完全合法；静态持久化通常只提交约一个 resident wave，是这种调度策略的选择，而不是 CUDA 对 grid 大小的限制。最大可支持的 cluster shape 和实际 occupancy 都依赖设备与 kernel 配置。
+
 如果 cluster 含有多个 CTA，那么一个 cluster 级的工作分配实际上对应一组 CTA-level 输出 tile。除非需要区分这两个层次，下文仍简称为一个 work tile。
 
 本文讨论 **Cluster Launch Control**（CLC），这是 NVIDIA Blackwell GPU 上一项由硬件支持的特性，用于实现高效的动态 tile 调度，尤其改善**负载均衡（load balancing）**。CLC 并不保证对所有问题都优于静态调度，具体选择仍然取决于 workload 和数据局部性。为了给出背景，我们先回顾几种常见的调度策略，以及 CLC 所要解决的这些策略的不足。接着我们逐行讲解在 CuTe DSL kernel 中使用 CLC 的实现细节，最后以一个 GEMM kernel 的性能对比收尾。
+
+下面提到的 **descriptor setup** 是一个概括性说法。以 TMA tensor map descriptor 为例，它描述张量的基址、形状、步长和 swizzle 等信息；在规则的 dense GEMM 中，同一个 descriptor 往往可以服务多个输出 tile，每个 tile 只需使用不同坐标，并不一定要重写 descriptor。本节所说的固定启动成本还包括建立或加载 descriptor/iterator 视图、初始化 shared-memory barrier 和 pipeline state、划分各 warp 的角色以及其他只需为一个驻留 worker 做一次的公共准备。对于 grouped GEMM 或运行时形状变化的 kernel，切换问题时则可能需要选择或更新不同的 descriptor。
 
 ### 单 tile 调度（Single Tile Scheduling）
 
 最朴素的选择是提交覆盖完整问题的 grid，并把每个 work tile 分配给唯一的一个逻辑 cluster。假设问题有 512 个 cluster-level work tile，而 GPU 最多并发驻留 74 个这种 cluster，那么 kernel grid 中有 512 个逻辑 cluster，但第一波最多只有 74 个真正开始执行，其余 cluster 在硬件调度队列中等待资源。
 
-每个 cluster 只完成自己的一个 work tile：初始化流水线和 descriptor，执行 mainloop 和 epilogue，然后退出。某个 cluster 退出并释放 SM 资源后，硬件调度器再从尚未启动的 cluster 中选择一个进行派发。这里启动的是一个新的 cluster 实例，并不是刚退出的 cluster 继续处理下一个任务；这些派发都属于同一次 CUDA kernel launch，也不是 host 再次启动 kernel。等待中的 cluster 也没有预先绑定到某个 SM 的专属队列。
+每个 cluster 只完成自己的一个 work tile。一次典型的执行过程如下：
+
+1. cluster 获得 SM 资源，从 kernel 入口开始执行；
+2. 各 CTA 建立 shared-memory 布局，初始化 mainloop/epilogue pipeline、mbarrier 和 warp-role state，并建立或加载所需的 descriptor/iterator 视图；
+3. 根据 `blockIdx` 和 cluster 内 CTA rank 计算唯一的输出 tile 坐标，建立该 tile 的 A、B、C tensor slice；
+4. producer warp 通过 TMA 等机制分阶段加载 A/B，consumer warp 沿 K 维执行 MMA mainloop；
+5. 执行 epilogue，把 accumulator 变换并写回对应的 C tile；
+6. 排空 pipeline，完成必要的 barrier/fence，随后整个 cluster 退出并释放资源。
+
+某个 cluster 退出后，硬件调度器再从尚未启动的 cluster 中选择一个进行派发。新 cluster 会重新执行上述 1～6 步，包括其中的公共初始化。这里启动的是一个新的 cluster 实例，并不是刚退出的 cluster 继续处理下一个任务；这些派发都属于同一次 CUDA kernel launch，也不是 host 再次启动 kernel。等待中的 cluster 也没有预先绑定到某个 SM 的专属队列。
 
 在理想化的并发容量为 74 的情况下，512 个 cluster 大约形成
 
@@ -42,6 +64,8 @@ $$
 
 个 wave。最后一个 wave 通常无法填满全部 SM，这种由任务数量不能整除并发容量造成的尾部空闲称为 **wave quantization（波次量化）**。即使所有 tile 的耗时完全相同，它也会出现，因此它与“不同 tile 耗时不同”造成的负载不均衡不是同一个概念。
 
+任何调度器都不能凭空创造并行工作。例如，只剩 26 个可并行 tile、硬件容量却是 74 个 cluster 时，其余资源必然空闲；CLC 也无法消除这种固有的 wave quantization。CLC 能改善的是由于 tile 耗时不同、静态任务分配不佳或实际 worker 数变化而造成的额外尾部拖延。
+
 单 tile 调度的优点是硬件会自然地把尚未启动的 cluster 派发给先空闲的资源，所以对 tile 执行时间波动具有良好的负载均衡能力，也保留了为其他 kernel 让出资源的灵活性。缺点是每个 cluster 都要付出固定的初始化和退出开销，而这些开销只被摊销到单个 tile 上。此外，不同 cluster 之间无法直接把一个 tile 的 epilogue 与另一个 tile 的 mainloop 重叠。
 
 ### 静态持久化 tile 调度（Static Persistent Tile Scheduling）
@@ -49,6 +73,8 @@ $$
 另一方面，我们也可以选择采用持久化（persistent）的 tile 调度方案。这里我们简要回顾一下持久化 tile 调度的概念，更详细的阐述请读者参阅我们的[前一篇文章](https://research.colfax-intl.com/cutlass-tutorial-persistent-kernels-and-stream-k/)。
 
 在静态持久化的设定下，我们不再为每个 work tile 分别提交一个 cluster，而是只启动一组 **worker cluster**。worker 数量通常取该 kernel 在空闲 GPU 上理论可同时驻留的 cluster 数量，并受问题总 tile 数量限制。这个理论值可以在 launch 前根据设备属性和 kernel 的资源占用计算；它是 occupancy 上限，并不保证 kernel 实际运行时所有 worker 都能立刻获得资源。例如，其他并发 kernel 可能占用部分 SM。
+
+在单进程、单 stream、GPU 独占的常见基准测试中，同一 stream 的 kernel 按顺序执行，因而静态 scheduler 计算出的理论 occupancy 往往很接近真正得到的并发 worker 数。运行时资源不确定主要出现在允许 kernel overlap 的环境，例如多个 CUDA stream、CUDA Graph 的并行分支、框架或 NCCL 使用的内部 stream，以及通过 CUDA MPS 共享 GPU 的多个进程。多个 stream 只提供并发的可能，是否真的 overlap 仍取决于依赖关系和剩余资源；普通多进程若未使用 MPS，通常采用 context 分时而不是同时占据不同 SM。MIG 则预先划分可见硬件资源，不等同于这里的临时资源竞争。
 
 一旦某个 worker cluster 开始运行，它就会“持久地（persist）”驻留在分配给它的硬件资源上，在 kernel 内部的循环中连续计算多个 work tile，直到自己的静态任务序列耗尽才退出。假设总共有 $T=512$ 个 work tile，并启动 $W=74$ 个 worker，那么编号为 $w$ 的 worker 可以处理
 
@@ -59,6 +85,27 @@ $$
 也就是说，worker 0 处理 tile 0、74、148……，worker 1 处理 tile 1、75、149……。此时 grid 中只有 74 个 worker cluster；其余 438 个 tile 只是任务编号，并不存在与它们一一对应、等待启动的 cluster 实例。
 
 例如，给定 148 个 SM、cluster 大小为 2，并且这个 GEMM 的资源占用使每个 SM 同时只能承载一个相关 CTA，我们可以在空闲 GPU 上并发驻留 74 个 cluster。这里的 74 是这个特定配置的 occupancy 结果，不是“cluster 数量永远等于 SM 数除以 cluster size”的通用规则：如果一个 SM 可以同时驻留多个 CTA，并发 cluster 数也会相应变化。
+
+单个静态 worker 的执行过程可以写成：
+
+```text
+执行一次公共初始化：
+  建立 shared-memory storage、descriptor/iterator 视图
+  初始化 mainloop/epilogue pipeline 和 barrier
+
+tile_id = worker_id
+while tile_id < num_tiles:
+  把 tile_id 解码为 (m, n, batch/problem) 坐标
+  更新本轮的 tensor slice、边界谓词和 accumulator
+  执行 TMA load + K-loop MMA mainloop
+  执行 epilogue/store
+  推进或复用 pipeline state
+  tile_id += num_workers
+
+排空 pipeline 并退出 cluster
+```
+
+因此，静态持久化并没有省掉每个 tile 真正需要的 TMA load、MMA、epilogue、坐标计算和 accumulator 初始化。它省掉或摊薄的是“退出当前 cluster、派发新 cluster、从 kernel 入口重做公共初始化”的成本。具体 kernel 能复用多少 descriptor 或 pipeline 状态取决于实现；不能笼统理解为切换 tile 完全没有开销。
 
 ![GEMM 的输出 C 被切分为 5 × 6 的 work tile 网格，每个 tile 由八个 cluster 之一计算；分配给 cluster 0 的 tile 被高亮标出](images/fig01_static_persistent_partition.png)
 
@@ -115,6 +162,14 @@ $$2 * \text{bM} * \text{bN} * K = 2 * 2^7 * 2^7 * 2^{11} = 2^{26} \text{ FLOPs}.
 
 动态持久化是一种调度策略，并不规定唯一的 grid 形状。使用全局原子计数器的传统实现通常只启动与理论并发容量相当的 worker 数量，然后让它们从软件工作队列领取 tile；Blackwell CLC 实现则提交与 single-tile 调度相同的完整逻辑 grid，再让已经实际启动的 cluster 取消尚未启动的 cluster，并接管其坐标所代表的工作。后文将详细解释这一区别。
 
+传统全局原子计数器实现中，一个 worker 每次领取新 work 通常要执行：对全局 counter 做 atomic fetch-and-increment、检查返回的 tile id 是否越界、把线性 id 解码成问题/tile 坐标，然后让 cluster 内所有参与者使用这个坐标开始下一轮计算。其主要额外成本是全局原子操作、cache/coherence 流量以及 kernel launch 前把 counter 清零。除此之外，它和静态持久化一样复用已驻留 cluster 的公共状态。
+
+CLC 把“从全局 counter 取编号”替换成硬件取消协议：一个 scheduler thread 发出异步 `try_cancel`，用 transaction mbarrier 等待 16 字节响应，先通过 `query_cancel.is_canceled` 判断成功与否；成功时再通过 `query_cancel.get_first_ctaid` 解码被取消 cluster 的坐标，并把结果同步或 multicast 给 cluster 内需要它的 CTA/warp。各参与者根据 cluster 内 rank 修正坐标、建立新 tile 的 tensor slice，然后继续 mainloop 和 epilogue。如果取消失败，worker 不能继续发出新的 `try_cancel`，而是在排空已经取得的工作和 pipeline 后退出。
+
+从概念上可以说“worker 完成当前 tile 后再领取下一个 tile”，但实际高性能实现通常由独立 scheduler warp 提前发出请求，并用一到多个 CLC pipeline stage 缓存结果，从而把调度延迟与当前 tile 的 mainloop/epilogue 重叠。预取过深会提前给某些 worker 囤积过多任务，反而削弱动态负载均衡。
+
+动态调度主要处理两类不确定性：一是所有 worker 都已驻留，但不同 tile 的 K、序列长度或有效计算量不同；二是并发 kernel 等因素使实际驻留的 worker 数少于 launch 前的理论值。前者即使在单 stream、独占 GPU 上也会出现，例如 grouped GEMM 和变长 attention。相反，对于 tile 耗时一致、GPU 独占且数据局部性良好的规则 dense GEMM，静态持久化没有动态领取工作的同步成本，并可能具有更可预测的 cache locality，因此 CLC 不一定更快。
+
 让我们看看动态分配如何避免前面例子中的负载不均衡。在一个合理的假设下——即 cluster 处理来自问题 0 或 2 的 tile 所需的时间，远小于处理来自问题 1 或 3 的 tile 所需的时间——work tile 到 cluster 的分配可能会呈现如下形态：
 
 ![在动态持久化情形下，每个 cluster 先拿到一个初始 tile，随后在完成当前工作时再去获取新的 tile](images/fig04_dynamic_assignment.png)
@@ -125,11 +180,11 @@ $$2 * \text{bM} * \text{bN} * K = 2 * 2^7 * 2^7 * 2^{11} = 2^{26} \text{ FLOPs}.
 
 三种策略可以概括如下：
 
-| 调度策略 | 提交的逻辑 cluster 数量 | 一个实际启动的 cluster 处理多少 work | 下一个 work 如何决定 | 主要特点 |
+| 调度策略 | 提交的逻辑 cluster 数量 | 一个实际启动的 cluster 处理多少 work | 每次取得下一个 work 的调度操作 | 主要特点 |
 | --- | --- | --- | --- | --- |
-| 单 tile | 与完整问题的 cluster-level work 数量相当 | 一个 | 该 cluster 没有下一个 work；退出后由硬件派发新的 cluster | 自然负载均衡和抢占灵活性较好，但每个 tile 都重复承担 cluster 初始化成本 |
-| 静态持久化 | 通常取理论可并发驻留的 worker 数量 | 多个 | launch 前为每个 worker 固定任务序列 | 初始化成本被摊销，也便于跨 tile 重叠；但不能适应 tile 耗时差异或实际可用 SM 数量变化 |
-| 动态持久化 | 传统原子实现通常只提交少量 worker；CLC 提交完整逻辑 grid | 多个 | 完成当前 tile 后在运行时领取 | 兼顾持久化的摊销优势和动态负载均衡，但存在调度开销，并可能改变 cache locality |
+| 单 tile | 与完整问题的 cluster-level work 数量相当 | 一个 | cluster 内没有“下一个 work”；退出后由硬件派发新的 cluster，新 cluster 重新执行公共初始化 | 自然负载均衡和抢占灵活性较好，但每个 tile 都重复承担 cluster 初始化成本 |
+| 静态持久化 | 通常取理论可并发驻留的 worker 数量 | 多个 | 对静态线性 id 加 `num_workers`，做坐标解码和有效性检查；无需全局原子或 CLC 请求 | 初始化成本被摊销，也便于跨 tile 重叠；但不能适应 tile 耗时差异或实际可用 SM 数量变化 |
+| 动态持久化 | 传统原子实现通常只提交少量 worker；CLC 提交完整逻辑 grid | 多个 | 原子实现执行 fetch-and-increment；CLC 执行 `try_cancel`、mbarrier 等待、`query_cancel` 解码和 cluster 内广播/同步 | 兼顾持久化的摊销优势和动态负载均衡，但存在调度与同步开销，并可能改变 cache locality |
 
 ![动态持久化情形下每个 cluster 所完成的工作（以计算的 FLOP 数量衡量），分布更加均匀](images/fig05_dynamic_flops.png)
 
@@ -159,7 +214,7 @@ $$2 * \text{bM} * \text{bN} * K = 2 * 2^7 * 2^7 * 2^{11} = 2^{26} \text{ FLOPs}.
 1. 每个 tile 最终都会被某个 cluster 处理，且
 2. 没有任何 tile 会被超过一个 cluster 处理。
 
-一种标准策略是维护一个全局原子计数器（即信号量锁），用它来追踪下一个尚未分配的 tile。当某个 cluster 完成它当前的 tile 时，它对这个计数器执行原子的 fetch-and-increment（取值并自增），以此认领下一个 tile 索引。每个 cluster 会持续请求工作，直到返回的 tile 索引大于等于 tile 总数为止，从而保证性质 (1)。由于原子操作是可线性化的（linearizable），每个 cluster 都会拿到唯一的 tile 索引，从而保证性质 (2)。这一策略的一个实现例子见 [quack tile scheduler](https://github.com/Dao-AILab/quack/blob/d898157f6761759161c48af94be1332dfd00697e/quack/tile_scheduler.py#L393)。
+一种标准策略是维护一个全局原子计数器，用它来追踪下一个尚未分配的 tile。当某个 cluster 需要取得新工作时，它对这个计数器执行原子的 fetch-and-increment（取值并自增），以此认领下一个 tile 索引。每个 cluster 会持续请求工作，直到返回的 tile 索引大于等于 tile 总数为止，从而保证性质 (1)。由于原子操作是可线性化的（linearizable），每个 cluster 都会拿到唯一的 tile 索引，从而保证性质 (2)。这一策略的一个实现例子见 [quack tile scheduler](https://github.com/Dao-AILab/quack/blob/d898157f6761759161c48af94be1332dfd00697e/quack/tile_scheduler.py#L393)。
 
 尽管这种做法简单且与架构无关，它也并非没有缺点。所有 cluster 都必须反复对同一个全局计数器执行原子操作。这在 cluster 之间引入了一定程度的串行化，并且需要反复往返访问全局内存。此外，在每次 kernel 启动之前，还必须把这个全局计数器清零。
 
@@ -169,7 +224,7 @@ $$2 * \text{bM} * \text{bN} * K = 2 * 2^7 * 2^7 * 2^{11} = 2^{26} \text{ FLOPs}.
 
 CLC 是从 Blackwell 架构开始提供的、由硬件支持的动态持久化 tile 调度实现。它最初提交的启动网格与单 tile 调度器的网格完全相同，即由问题的 work tile 数量决定，而不是由 SM 数量或理论 occupancy 决定——参见后文讲解中对 `_compute_grid` 的讨论。
 
-仍以 512 个 cluster-level work tile、最多并发驻留 74 个 cluster 为例：CLC 会在逻辑 grid 中提交 512 个 cluster，第一波最多只有 74 个实际开始执行，其余 cluster 仍处于尚未启动的状态。一个活跃 cluster 完成自己的初始 tile 后不会退出，而是继续留在 persistent loop 中发出 `try_cancel`。如果请求成功，硬件会原子地取消某个尚未执行的 cluster 的未来启动，并返回该 cluster 中第一个 CTA 的 grid 坐标。活跃 cluster 随后用这个坐标计算被接管的 tile，再继续尝试取消和接管其他工作。
+仍以 512 个 cluster-level work tile、最多并发驻留 74 个 cluster 为例：CLC 会在逻辑 grid 中提交 512 个 cluster，第一波最多只有 74 个实际开始执行，其余 cluster 仍处于尚未启动的状态。每个活跃 cluster 直接把自己的 `blockIdx` 作为初始 work 坐标，初始 work 不需要执行 CLC 查询。为了取得后续 work，它会保持在 persistent loop 中发出 `try_cancel`；概念上可以把这理解为完成当前 tile 后再领取下一个，而实际实现中的 scheduler warp 可以提前预取。如果请求成功，硬件会原子地取消某个尚未执行的 cluster 的未来启动，并返回该 cluster 中第一个 CTA 的 grid 坐标。活跃 cluster 随后用这个坐标计算被接管的 tile，再继续尝试取消和接管其他工作。
 
 例如，为了说明流程，假设活跃的 cluster 0 得到了尚未启动的 cluster 74 的坐标：cluster 74 将永远不会真正开始执行，cluster 0 则在完成 tile 0 后继续计算 tile 74。这里没有杀死正在运行的 cluster，也不是 cluster 0 退出后重新启动；被取消的只是一个尚未产生执行副作用的未来派发。实际返回哪个可取消 cluster 由硬件在运行时决定，程序员不能依赖这个示例编号。
 
